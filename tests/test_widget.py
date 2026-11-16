@@ -52,46 +52,45 @@ class WidgetTests(unittest.TestCase):
         self.assertEqual(json.loads(state)["h"], "—")
         self.assertLessEqual(len(widget_caption(self.plane).encode()), 900)
 
-    def test_private_chat_gets_captioned_widget_after_card_without_new_provider_calls(self):
+    def test_private_chat_gets_captioned_gif_after_card_without_new_provider_calls(self):
         self.bot.send_aircraft(123, self.plane, 50, 1800000000)
         calls = self.bot.call.call_args_list
-        self.assertEqual([call.args[0] for call in calls], ["sendMessage", "sendWidget"])
+        self.assertEqual([call.args[0] for call in calls], ["sendMessage", "sendAnimation"])
         widget = calls[-1].kwargs
-        self.assertEqual(json.loads(widget["chat_data"])["c"], "TAP123")
+        self.assertTrue(widget["animation"].startswith(b"GIF89a"))
         self.assertIn("Lisbon → London", widget["caption"])
-        self.assertFalse(widget["allow_queries"])
-        self.assertNotIn("public_data", widget)
+        self.assertTrue(widget["disable_notification"])
         self.bot.provider.nearby.assert_not_called()
 
-    def test_photo_is_preserved_beside_offline_widget(self):
+    def test_photo_is_preserved_beside_offline_animation(self):
         self.plane.photo_url = "https://photos.example.com/aircraft.jpg"
         self.bot.send_aircraft(123, self.plane, 50, 1800000000)
-        self.assertEqual([call.args[0] for call in self.bot.call.call_args_list], ["sendPhoto", "sendWidget"])
+        self.assertEqual([call.args[0] for call in self.bot.call.call_args_list], ["sendPhoto", "sendAnimation"])
 
-    def test_groups_never_call_production_widget_method(self):
+    def test_groups_receive_standard_gif_animation(self):
         self.bot.send_aircraft(-123, self.plane, 50, 1800000000)
-        self.assertEqual([call.args[0] for call in self.bot.call.call_args_list], ["sendMessage"])
+        self.assertEqual([call.args[0] for call in self.bot.call.call_args_list], ["sendMessage", "sendAnimation"])
 
-    def test_disabled_widget_retains_standard_card(self):
+    def test_disabled_animation_retains_standard_card(self):
         self.bot.widgets_enabled = False
         self.bot.send_aircraft(123, self.plane, 50, 1800000000)
         self.assertEqual(self.bot.call.call_count, 1)
 
-    def test_unsupported_widget_does_not_lose_or_repeat_delivered_card(self):
+    def test_rejected_animation_does_not_lose_or_repeat_delivered_card(self):
         self.bot.call.side_effect = [{"message_id": 1}, APIError(400), {"message_id": 2}]
         self.bot.send_aircraft(123, self.plane, 50, 1800000000)
         self.bot.send_aircraft(123, self.plane, 50, 1800000060)
         self.assertEqual([call.args[0] for call in self.bot.call.call_args_list],
-                         ["sendMessage", "sendWidget", "sendMessage"])
+                         ["sendMessage", "sendAnimation", "sendMessage"])
 
-    def test_widget_rate_limit_keeps_card_delivered_and_pauses_subsequent_alerts(self):
+    def test_animation_rate_limit_keeps_card_delivered_and_pauses_subsequent_alerts(self):
         self.bot.call.side_effect = [{"message_id": 1}, APIError(429, 120)]
         with patch("bot.time.time", return_value=100):
             result = self.bot.send_aircraft(123, self.plane, 50, 1800000000)
         self.assertEqual(result["message_id"], 1)
         self.assertEqual(self.bot.telegram_blocked_until, 220)
 
-    def test_failed_photo_prevents_widget_and_preserves_normal_retry_behavior(self):
+    def test_failed_photo_prevents_animation_and_preserves_normal_retry_behavior(self):
         self.plane.photo_url = "https://photos.example.com/aircraft.jpg"
         self.bot.call.side_effect = APIError(503)
         with self.assertRaises(APIError):

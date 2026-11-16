@@ -1,4 +1,4 @@
-"""Airways: nearby-flight alerts with per-chat API access and message widgets."""
+"""Airways: nearby-flight alerts with per-chat API access and animated flight boards."""
 
 import html
 import json
@@ -7,6 +7,7 @@ import math
 import os
 import re
 import time
+import uuid
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -17,7 +18,8 @@ from urllib.request import Request, urlopen
 
 from tracking import WatchStore
 from access import CredentialVault
-from flight_widget import widget_html, widget_data, widget_caption
+from flight_widget import widget_caption
+from flight_animation import flight_gif
 
 LOG = logging.getLogger("airways")
 EARTH_KM = 6371.0088
@@ -46,11 +48,21 @@ def telegram_error_reason(description, url):
     return " ".join(description.split())[:240]
 
 
-def request_json(url, *, payload=None, form=None, headers=None, timeout=20, widget_errors=False):
+def request_json(url, *, payload=None, form=None, headers=None, timeout=20, widget_errors=False, files=None):
     """Never include request URLs, credentials, or response bodies in errors."""
     headers = dict(headers or {})
     data = None
-    if payload is not None:
+    if files:
+        boundary = "airways-" + uuid.uuid4().hex
+        parts = []
+        for key, value in (payload or {}).items():
+            encoded = json.dumps(value) if isinstance(value, (bool, dict, list)) else str(value)
+            parts.append(f'--{boundary}\r\nContent-Disposition: form-data; name="{key}"\r\n\r\n{encoded}\r\n'.encode())
+        for key, (filename, content_type, content) in files.items():
+            parts.append(f'--{boundary}\r\nContent-Disposition: form-data; name="{key}"; filename="{filename}"\r\nContent-Type: {content_type}\r\n\r\n'.encode() + content + b"\r\n")
+        data = b"".join(parts) + f"--{boundary}--\r\n".encode()
+        headers["Content-Type"] = "multipart/form-data; boundary=" + boundary
+    elif payload is not None:
         data = json.dumps(payload).encode()
         headers["Content-Type"] = "application/json"
     elif form is not None:
@@ -414,7 +426,13 @@ class Bot:
         self.send(chat_id, f"Access removed for chat <code>{target}</code>. Saved credentials and its watch were deleted.")
 
     def call(self, method, **payload):
-        data = request_json(self.base + method, payload=payload, timeout=40, widget_errors=method == "sendWidget")
+        files = None
+        if method == "sendAnimation" and isinstance(payload.get("animation"), bytes):
+            files = {"animation": ("airways.gif", "image/gif", payload.pop("animation"))}
+        options = dict(payload=payload, timeout=40, widget_errors=method == "sendWidget")
+        if files:
+            options["files"] = files
+        data = request_json(self.base + method, **options)
         if not data.get("ok"):
             reason = telegram_error_reason(data.get("description", ""), self.base + method) if method == "sendWidget" else ""
             raise APIError(data.get("error_code", 0), data.get("parameters", {}).get("retry_after", 5), reason)
@@ -429,21 +447,20 @@ class Bot:
 
     def send_aircraft(self, chat_id, plane, radius, timestamp, alert=False):
         result = self.send_aircraft_card(chat_id, plane, radius, timestamp, alert)
-        # Widgets supplement the delivered photo/text so older clients never lose the alert.
-        if self.widgets_enabled and chat_id > 0 and time.monotonic() >= self.widget_unavailable_until:
+        # GIFs work in groups and private chats without restricted HTML widgets.
+        if self.widgets_enabled and time.monotonic() >= self.widget_unavailable_until:
             try:
-                self.call("sendWidget", chat_id=chat_id, html=widget_html(),
-                          chat_data=widget_data(plane, timestamp), caption=widget_caption(plane, timestamp),
-                          allow_queries=False, protect_content=True)
+                self.call("sendAnimation", chat_id=chat_id, animation=flight_gif(plane, timestamp),
+                          caption=widget_caption(plane, timestamp), width=960, height=656,
+                          disable_notification=True)
             except APIError as error:
-                LOG.info("Message widget unavailable (status %s, reason: %s); flight card was delivered",
-                         error.status, error.reason or "not provided")
-                if error.status in (400, 404):
+                LOG.info("Flight animation unavailable (status %s); flight card was delivered", error.status)
+                if error.status in (400, 403, 404):
                     self.widget_unavailable_until = time.monotonic() + 3600
                 elif error.status == 429:
                     self.telegram_blocked_until = time.time() + error.retry_after
             except (ValueError, OSError):
-                LOG.warning("Flight widget could not be built; flight card was delivered")
+                LOG.warning("Flight animation could not be built; flight card was delivered")
         return result
 
     def send_aircraft_card(self, chat_id, plane, radius, timestamp, alert=False):
@@ -738,7 +755,7 @@ def main():
             admin_server = start_admin(os.environ.get("STATE_DB_PATH", "data/airways.sqlite3"))
         owner_provider = OpenSky(client_id, client_secret) if client_id else None
         Bot(token, owner_provider, radius, store, FlightDetails(), interval, vault=vault,
-            widgets_enabled=os.environ.get("TELEGRAM_WIDGETS", "1") != "0").run()
+            widgets_enabled=os.environ.get("TELEGRAM_ANIMATIONS", os.environ.get("TELEGRAM_WIDGETS", "1")) != "0").run()
     except KeyboardInterrupt:
         LOG.info("Airways stopped")
     except APIError as error:

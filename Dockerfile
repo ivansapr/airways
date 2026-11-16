@@ -2,7 +2,7 @@ FROM python:3.13-slim
 WORKDIR /app
 COPY requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
-COPY bot.py tracking.py admin.py access.py flight_widget.py ./
+COPY bot.py tracking.py admin.py access.py flight_widget.py flight_animation.py ./
 COPY widgets ./widgets
 COPY admin_static ./admin_static
 RUN mkdir /data && chown 65534:65534 /data

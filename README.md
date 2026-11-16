@@ -94,13 +94,11 @@ Watches, duplicate history, and Telegram update offsets are stored in SQLite. Ke
 
 ## Animated Telegram flight board
 
-Private-chat alerts include an animated airport-style board beside the existing aircraft photo/text card. It shows the callsign on staggered flip-style tiles, full route city names, aircraft model, altitude, ground speed, distance, and the snapshot time. Tap **Replay board** to replay the local animation. Reduced-motion preferences disable animation. Light/dark styling follows Telegram's chat palette, and the layout fits compact message bubbles without internal scrolling.
+Alerts in private and group chats include an amber dot-matrix GIF beside the aircraft photo/text card. It loops between a flight overview (callsign, origin, destination, distance) and aircraft details (model, altitude, speed, distance), with a staggered LED refresh. Each screen holds for about three seconds. The observation time stays visible. Full original city names also remain in the caption; the LED font uses uppercase Latin transliterations.
 
-Set `TELEGRAM_WIDGETS=0` to disable the additional widget messages; the default is `1`. As documented by [Telegram Widgets](https://core.telegram.org/bots/widgets), production widgets currently work only in private chats. Group alerts retain their ordinary photo/text cards. Widget messages include a caption for clients that cannot render them. If the API rejects a widget, the already-delivered photo/text card remains available, with no duplicate alert retry. Unsupported-widget errors pause further widget attempts for one hour; Telegram rate-limit errors pause subsequent alert delivery.
+Set `TELEGRAM_ANIMATIONS=0` to disable additional GIF messages (default: `1`). Existing `TELEGRAM_WIDGETS=0` configurations still disable animations unless overridden by the new setting. GIFs use Telegram's standard `sendAnimation` upload; restricted HTML widgets are no longer sent. Telegram/client autoplay settings determine whether the GIF plays automatically.
 
-The widget is a snapshot, not a continuously refreshed display: the time shown belongs to that flight observation. Its animation and replay button are entirely local. It uses the same paid provider lookup and metadata as the alert; no additional flight-data calls, widget queries, refresh loop, or external assets are requested. Telegram widgets cannot load remote images, so real aircraft photos stay in the companion photo message. The widget never contains credentials, promo codes, or the user's location.
-
-The code lives in `widgets/flight_board.html` and is loaded by `flight_widget.py`. Its HTML is checked against Telegram's 32 KB raw / 4 KB zlib limits before sending, and its UTF-8 chat state is capped at 1 KB. This implementation uses 2D transforms, inline CSS/JavaScript/SVG, system fonts, and the native theme variables. Template edits apply to newly sent widgets; already sent messages keep their original code.
+`flight_animation.py` renders the GIF in memory with Pillow and an embedded LED font. No external fonts, image downloads, extra flight-data lookups, or refresh requests are needed. Each GIF is a snapshot of the observation, not a live feed. If animation upload fails, the delivered photo/text remains; rate limits pause subsequent alerts. The board contains no credentials, promo codes, or user coordinates.
 
 ## Admin dashboard
 
