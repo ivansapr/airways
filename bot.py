@@ -6,11 +6,15 @@ import logging
 import math
 import os
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from threading import Lock
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
+
+from tracking import WatchStore
 
 LOG = logging.getLogger("airways")
 EARTH_KM = 6371.0088
@@ -99,6 +103,8 @@ class Aircraft:
     speed: float | None
     heading: float | None
     age: int
+    aircraft_type: str = "Unknown"
+    route: str = "Unknown"
 
 
 def finite_number(value):
@@ -172,33 +178,83 @@ class OpenSky:
         return nearby_aircraft(states, lat, lon, radius, now), now
 
 
-def format_report(aircraft, radius, timestamp):
+class FlightDetails:
+    """Best-effort adsbdb lookups; cache only in memory, never build a route database."""
+
+    def __init__(self):
+        self.cache = {}
+        self.lock = Lock()
+
+    def enrich(self, plane):
+        key = (plane.icao, plane.callsign)
+        now = time.monotonic()
+        with self.lock:
+            cached = self.cache.get(key)
+        if cached and cached[0] > now:
+            plane.aircraft_type, plane.route = cached[1:]
+            return
+        url = f"https://api.adsbdb.com/v0/aircraft/{plane.icao}?" + urlencode({"callsign": plane.callsign})
+        ttl = 300
+        try:
+            data = request_json(url, timeout=4).get("response", {})
+            if not isinstance(data, dict):
+                data = {}
+            aircraft = data.get("aircraft") or {}
+            route = data.get("flightroute") or {}
+            plane.aircraft_type = str(aircraft.get("type") or aircraft.get("icao_type") or "Unknown")[:60]
+            airports = [route.get(part) or {} for part in ("origin", "midpoint", "destination")]
+            codes = [str(port.get("iata_code") or port.get("icao_code") or "")[:8] for port in airports]
+            if codes[0] and codes[-1]:
+                plane.route = " → ".join(code for code in codes if code)
+            ttl = 3600
+        except (APIError, AttributeError, TypeError, ValueError):
+            pass  # Metadata must never prevent an alert with live position data.
+        with self.lock:
+            if len(self.cache) >= 2048:
+                self.cache = {k: v for k, v in self.cache.items() if v[0] > now}
+                if len(self.cache) >= 2048:
+                    self.cache.clear()
+            self.cache[key] = (now + ttl, plane.aircraft_type, plane.route)
+
+    def enrich_all(self, planes):
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            list(pool.map(self.enrich, planes))
+
+
+def format_report(aircraft, radius, timestamp, alert=False):
     stamp = datetime.fromtimestamp(timestamp, timezone.utc).strftime("%H:%M UTC")
     if not aircraft:
         return (f"No recently reported airborne aircraft within {radius:g} km.\n"
                 f"Checked {stamp}. Coverage can be incomplete; try again shortly.")
-    lines = [f"✈️ <b>{len(aircraft)} aircraft within {radius:g} km</b>", f"Checked {stamp} · nearest first"]
+    title = "Passing nearby" if alert else f"{len(aircraft)} aircraft within {radius:g} km"
+    lines = [f"✈️ <b>{title}</b>", f"Checked {stamp} · nearest first"]
     for plane in aircraft[:8]:
         altitude = f"{plane.altitude:,.0f} m" if plane.altitude is not None else "unknown"
         speed = f"{plane.speed * 3.6:.0f} km/h" if plane.speed is not None else "unknown"
         heading = f"{plane.heading:.0f}°" if plane.heading is not None else "unknown"
         lines.append(
             f'\n<b>{html.escape(plane.callsign[:32])}</b> · {plane.distance:.1f} km away\n'
+            f'Route: {html.escape(plane.route)}\nAircraft: {html.escape(plane.aircraft_type[:60])}\n'
             f'Altitude {altitude} · Speed {speed}\nHeading {heading} · Position {plane.age}s ago\n'
-            f'ICAO {plane.icao} · Registered country: {html.escape(plane.country[:64])}\n'
-            f'<a href="https://www.google.com/maps/search/?api=1&amp;query={plane.lat},{plane.lon}">Map</a> · '
+            f'ICAO {plane.icao} · Registered country: {html.escape(plane.country[:32])}\n'
+            f'<a href="https://www.google.com/maps/search/?api=1&amp;query={plane.lat:.5f},{plane.lon:.5f}">Map</a> · '
             f'<a href="https://globe.adsbexchange.com/?icao={plane.icao}">Aircraft tracker</a>')
     if len(aircraft) > 8:
         lines.append(f"\nShowing the nearest 8 of {len(aircraft)} aircraft.")
-    lines.append("\nSource: OpenSky Network · coverage may be incomplete.\nRoutes and destinations aren't available in this feed.")
+    lines.append("\nOpenSky Network · coverage may be incomplete.\nRoute/type: adsbdb · route is a callsign lookup, may be outdated.")
     return "\n".join(lines)
 
 
 class Bot:
-    def __init__(self, token, provider, radius=50):
+    def __init__(self, token, provider, radius=50, store=None, details=None, interval=60):
         self.base = f"https://api.telegram.org/bot{token}/"
         self.provider, self.radius = provider, radius
         self.cooldowns = {}
+        self.store = store if store is not None else WatchStore()
+        self.details = details
+        self.interval = interval
+        self.username = ""
+        self.telegram_blocked_until = 0
 
     def call(self, method, **payload):
         data = request_json(self.base + method, payload=payload, timeout=40)
@@ -214,24 +270,66 @@ class Bot:
         return self.call("sendMessage", **payload)
 
     def handle(self, update):
+        membership = update.get("my_chat_member")
+        if membership:
+            chat = membership["chat"]
+            self.store.record_chat(chat)
+            member = membership.get("new_chat_member", {})
+            if member.get("status") in ("left", "kicked") or (member.get("status") == "restricted" and not member.get("is_member")):
+                self.store.delete(chat["id"])
+            return
         message = update.get("message") or update.get("edited_message")
         if not message:
             return
         chat = message["chat"]
         chat_id = chat["id"]
-        if chat.get("type") != "private":
-            self.send(chat_id, "Please open a private chat with me to share your location.")
+        private = chat.get("type") == "private"
+        if chat.get("type") not in ("private", "group", "supergroup"):
+            return
+        self.store.record_chat(chat)
+        text = message.get("text", "")
+        first = text.split(maxsplit=1)[0] if text else ""
+        command, _, target = first.partition("@")
+        if target and target.lower() != self.username.lower():
             return
         location = message.get("location")
+        if command == "/watch":
+            location = message.get("reply_to_message", {}).get("location")
+        if "edited_message" in update:
+            watch = self.store.get(chat_id)
+            if not watch or watch.get("location_message_id") != message.get("message_id"):
+                return  # A stopped or replaced live location must not restart the watch.
+        if not private and (location or command in ("/watch", "/stop")):
+            user_id = message.get("from", {}).get("id")
+            # Anonymous administrators cannot be verified as an individual user.
+            member = self.call("getChatMember", chat_id=chat_id, user_id=user_id) if user_id and not message.get("sender_chat") else {}
+            if member.get("status") not in ("creator", "administrator"):
+                self.send(chat_id, "Only group administrators can set the watch location or stop alerts.")
+                return
+        if command == "/stop":
+            self.store.delete(chat_id)
+            self.send(chat_id, "Alerts stopped and the saved watch location deleted. Share a location to start again.")
+            return
+        if command == "/status":
+            watch = self.store.get(chat_id)
+            self.send(chat_id, (f"Watching within {watch['radius']:g} km. Checking every {self.interval:g} seconds. "
+                                "Use /stop to stop alerts and delete the saved location.") if watch else
+                      "No active watch. Share a location to start alerts.")
+            return
         if not location:
             if "edited_message" in update:
                 return
+            if not private and command not in ("/start", "/help", "/watch"):
+                return  # Don't answer ordinary group conversation or service messages.
             self.send(chat_id,
                       f"✈️ <b>Airways</b>\nShare your location to find airborne aircraft within {self.radius:g} km.\n\n"
-                      "Tap the button below, or use 📎 → Location. Each location message returns a snapshot; "
-                      "live location edits also refresh the results (at most once every 15 seconds).\n\n"
-                      "I don't save your location. The search area is sent to OpenSky to look up aircraft. "
-                      "Use /help to see these instructions again.", keyboard=True)
+                      "I'll save one watch location for this chat and send alerts when aircraft enter the area. "
+                      f"Checks run every {self.interval:g} seconds.\n\n"
+                      "Use 📎 → Location. In groups, an administrator can reply to a location with /watch@"
+                      f"{self.username or 'your_bot'}. Only group admins can change or stop the watch.\n\n"
+                      "Live location edits move the watch; the last position remains active after sharing ends.\n"
+                      "/status — check the watch\n/stop — stop alerts and delete the saved location\n\n"
+                      "Search areas are sent to OpenSky; aircraft identifiers go to adsbdb for route/type lookup.", keyboard=private)
             return
         lat, lon = location.get("latitude"), location.get("longitude")
         if not valid_location(lat, lon):
@@ -244,38 +342,104 @@ class Bot:
                 self.send(chat_id, "Please wait 15 seconds between flight searches.")
             return
         self.cooldowns[chat_id] = now + 15
+        source = message.get("reply_to_message", {}) if command == "/watch" else message
+        self.store.set_location(chat_id, lat, lon, self.radius, source.get("message_id"))
+        watch = self.store.get(chat_id)
+        watch["next_check"] = time.time() + self.interval
         try:
+            self.store.metric("flight_lookups")
             aircraft, timestamp = self.provider.nearby(lat, lon, self.radius)
+            if self.details:
+                self.details.enrich_all(aircraft[:8])
             report = format_report(aircraft, self.radius, timestamp)
         except APIError as error:
+            self.store.metric("flight_errors")
             LOG.warning("Aircraft lookup failed (status %s)", error.status)
             if error.status == 429:
                 report = f"The flight data limit has been reached. Try again in {math.ceil(error.retry_after)} seconds."
             else:
-                report = "Flight data is temporarily unavailable. Please send your location again later."
-        self.send(chat_id, report)
+                report = "Flight data is temporarily unavailable. I'll retry automatically."
+            aircraft, timestamp = [], time.time()
+            if error.status == 429:
+                watch["next_check"] = time.time() + max(self.interval, error.retry_after)
+        self.store.save(watch)
+        self.send(chat_id, "<b>Nearby-flight alerts are active.</b> Use /stop to stop and delete the saved location.\n\n" + report)
+        watch["seen"].update({plane.icao: timestamp for plane in aircraft})
+        self.store.save(watch)
+
+    def check_watches(self):
+        """Run independently of incoming location messages; send each arrival once."""
+        if time.time() < self.telegram_blocked_until:
+            return
+        for watch in self.store.due(time.time()):
+            chat_id = watch["chat_id"]
+            watch["next_check"] = time.time() + self.interval
+            try:
+                self.store.metric("flight_lookups")
+                aircraft, timestamp = self.provider.nearby(watch["lat"], watch["lon"], watch["radius"])
+            except APIError as error:
+                self.store.metric("flight_errors")
+                LOG.warning("Watch lookup failed (status %s)", error.status)
+                watch["next_check"] = time.time() + max(self.interval, error.retry_after)
+                self.store.save(watch)
+                continue  # An outage is not evidence that an aircraft left the area.
+            current = {plane.icao for plane in aircraft}
+            seen = watch["seen"]
+            # Rearm only after an aircraft was last observed at least ten minutes ago
+            # AND a successful subsequent query reports it outside the area.
+            watch["seen"] = {icao: timestamp if icao in current else last
+                             for icao, last in seen.items() if icao in current or timestamp - last < 600}
+            arrivals = [plane for plane in aircraft if plane.icao not in seen][:8]
+            if arrivals:
+                if self.details:
+                    self.details.enrich_all(arrivals)
+                try:
+                    if not self.store.get(chat_id):
+                        continue
+                    self.send(chat_id, format_report(arrivals, watch["radius"], timestamp, alert=True))
+                except APIError as error:
+                    self.store.metric("delivery_errors")
+                    if error.status == 403:
+                        self.store.delete(chat_id)  # Blocked bot or removed from group.
+                        continue
+                    LOG.warning("Alert delivery failed (status %s)", error.status)
+                    if error.status == 429:
+                        self.telegram_blocked_until = time.time() + error.retry_after
+                        self.store.save(watch)
+                        return
+                else:
+                    self.store.alert_sent(chat_id, len(arrivals))
+                    watch["seen"].update({plane.icao: timestamp for plane in arrivals})
+            self.store.save(watch)
 
     def run(self):
-        self.call("getMe")
+        self.username = self.call("getMe")["username"]
         if self.call("getWebhookInfo").get("url"):
             raise SystemExit("A webhook is configured. Remove it before running this polling bot.")
         self.call("setMyCommands", commands=[{"command": "start", "description": "Find nearby aircraft"},
-                                           {"command": "help", "description": "How to share your location"}])
+                                           {"command": "help", "description": "How to share your location"},
+                                           {"command": "watch", "description": "Watch a location (reply to a map pin)"},
+                                           {"command": "status", "description": "Check active alerts"},
+                                           {"command": "stop", "description": "Stop alerts and delete saved location"}])
         LOG.info("Airways is polling for location messages")
-        offset, backoff = 0, 1
+        offset, backoff = self.store.offset(), 1
         while True:
             try:
-                updates = self.call("getUpdates", offset=offset, timeout=25,
-                                    allowed_updates=["message", "edited_message"])
+                self.store.heartbeat()
+                self.check_watches()
+                updates = self.call("getUpdates", offset=offset, timeout=5,
+                                    allowed_updates=["message", "edited_message", "my_chat_member"])
                 for update in updates:
                     # Failed sends don't stall the whole bot or repeat expensive searches.
                     try:
                         self.handle(update)
                     except APIError as error:
+                        self.store.metric("delivery_errors")
                         LOG.warning("Reply failed (status %s)", error.status)
                         if error.status == 429:
                             time.sleep(error.retry_after)
                     offset = update["update_id"] + 1
+                    self.store.set_offset(offset)
                 backoff = 1
             except APIError as error:
                 if error.status in (401, 404, 409):
@@ -301,11 +465,25 @@ def main():
     except ValueError:
         raise SystemExit("SEARCH_RADIUS_KM must be a number between 1 and 250.") from None
     try:
-        Bot(token, OpenSky(client_id, client_secret), radius).run()
+        interval = float(os.environ.get("POLL_INTERVAL_SECONDS", "60"))
+        if not math.isfinite(interval) or interval < 15:
+            raise ValueError
+    except ValueError:
+        raise SystemExit("POLL_INTERVAL_SECONDS must be at least 15.") from None
+    try:
+        store = WatchStore(os.environ.get("STATE_DB_PATH", "data/airways.sqlite3"))
+        admin_server = None
+        if os.environ.get("ADMIN_PASSWORD"):
+            from admin import start_admin
+            admin_server = start_admin(os.environ.get("STATE_DB_PATH", "data/airways.sqlite3"))
+        Bot(token, OpenSky(client_id, client_secret), radius, store, FlightDetails(), interval).run()
     except KeyboardInterrupt:
         LOG.info("Airways stopped")
     except APIError as error:
         raise SystemExit(f"Telegram setup failed (status {error.status}). Check connectivity and bot credentials.") from None
+    finally:
+        if 'admin_server' in locals() and admin_server:
+            admin_server.shutdown()
 
 
 if __name__ == "__main__":

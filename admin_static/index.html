@@ -1,0 +1,41 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Control room · Airways</title><link rel="stylesheet" href="/admin.css">
+  <script src="/admin.js" defer></script>
+</head>
+<body>
+  <aside class="sidebar">
+    <a class="brand" href="/"><span class="brand-mark">↗</span> airways<span class="brand-dot">.</span></a>
+    <div class="workspace"><span class="workspace-icon">A</span><div>Your workspace<small>Bot administration</small></div><span>⌄</span></div>
+    <p class="nav-label">WORKSPACE</p>
+    <a class="nav-link selected" href="#overview"><span>◫</span> Overview <span class="nav-arrow">↗</span></a>
+    <a class="nav-link" href="#chats"><span>◷</span> Chats & watches</a>
+    <div class="sidebar-bottom"><div class="radar"><i></i><span>✈</span></div><h3>A little closer to the sky.</h3><p>Every passing flight.<br>One place to keep track.</p><div class="private-label">● PRIVATE CONTROL ROOM</div></div>
+  </aside>
+  <main class="content" id="overview">
+    <header class="topbar"><div class="breadcrumb">Workspace <span>/</span> Overview</div><button id="logout" class="ghost">Sign out ↗</button></header>
+    <section class="page-heading"><div><p class="eyebrow">YOUR BOT, AT A GLANCE</p><h1>Control room<span>.</span></h1><p class="muted">A clear view of your bot's activity, from takeoff to touchdown.</p></div><div class="status" id="bot-status">● Connecting</div></section>
+    <div class="toolbar"><span><span class="live-dot"></span> Live overview <span class="muted" id="updated">Loading…</span></span><button id="refresh" class="secondary">↻ Refresh</button></div>
+    <p id="error" class="error" role="alert" hidden></p>
+    <section class="stats" aria-label="Usage totals">
+      <article class="stat"><span>Total chats <span>↗</span></span><strong id="total-chats">—</strong><small>Groups and private conversations</small></article>
+      <article class="stat"><span>Active watches <span>◎</span></span><strong id="active-watches">—</strong><small>Locations looking out for aircraft</small></article>
+      <article class="stat"><span>Alerts today <span>✈</span></span><strong id="alerts-today">—</strong><small id="aircraft-today">Aircraft arrival notifications</small></article>
+      <article class="stat"><span>Flight checks today <span>⌁</span></span><strong id="checks-today">—</strong><small id="errors-today">Provider queries and errors</small></article>
+    </section>
+    <section class="activity-grid">
+      <article class="panel chart-panel"><div class="panel-heading"><div><p class="eyebrow">THE LAST 7 DAYS</p><h2>A week in the air</h2></div><span class="legend"><i></i> Alerts sent</span></div><div id="chart" class="chart" aria-label="Daily alerts for the last seven days"></div><p class="footnote">Daily totals in UTC · <span id="week-updates">—</span> updates received this week</p></article>
+      <article class="panel health-panel"><p class="eyebrow">OPERATIONS</p><h2>Keeping things moving</h2><div class="health-row"><span>Last bot heartbeat</span><strong id="heartbeat">—</strong></div><div class="health-row"><span>Flight data errors today</span><strong id="flight-errors">—</strong></div><div class="health-row"><span>Delivery errors today</span><strong id="delivery-errors">—</strong></div><div class="health-note"><span>↗</span><p>Watches stay active until stopped. Route and aircraft details appear when the provider has a match.</p></div></article>
+    </section>
+    <section class="panel chats-panel" id="chats"><div class="panel-heading"><div><p class="eyebrow">YOUR AUDIENCE</p><h2>Chats & watches <span id="chat-count" class="count">0</span></h2></div><label class="search"><span>⌕</span><input id="search" type="search" placeholder="Search chats or IDs" aria-label="Search chats or IDs"></label></div>
+      <div class="filters"><button class="filter active" data-filter="all">All chats</button><button class="filter" data-filter="watching">Watching</button><button class="filter" data-filter="group">Groups</button><button class="filter" data-filter="private">Private</button></div>
+      <div class="table-wrap"><table><thead><tr><th>CHAT</th><th>STATUS</th><th>WATCH LOCATION</th><th>USAGE</th><th>LAST ACTIVITY</th><th><span class="sr-only">Actions</span></th></tr></thead><tbody id="chat-rows"></tbody></table></div>
+      <div id="empty" class="empty" hidden><span>⌁</span><h3>No chats here yet</h3><p>Send /start to your bot or add it to a group.<br>Chats will appear as the bot receives updates.</p></div>
+      <div class="table-footer"><span id="results">Loading chats…</span><span>No message contents stored</span></div>
+    </section>
+    <footer class="footer"><span>airways. <span class="muted">A window into the passing sky.</span></span><span>Admin access only</span></footer>
+  </main>
+  <dialog id="stop-dialog"><form method="dialog"><p class="eyebrow">WATCH SETTINGS</p><h2>Stop this watch?</h2><p id="stop-description" class="muted"></p><p class="muted">The saved location will be deleted. The chat can share a new location to start again.</p><div class="dialog-actions"><button value="cancel" class="secondary">Keep watching</button><button value="confirm" class="danger">Stop watch</button></div></form></dialog>
+</body></html>

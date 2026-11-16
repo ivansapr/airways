@@ -1,3 +1,7 @@
 *
 !bot.py
+!tracking.py
+!admin.py
+!admin_static/
+!admin_static/**
 !Dockerfile

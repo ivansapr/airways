@@ -1,8 +1,11 @@
 import math
 import unittest
+import tempfile
+from pathlib import Path
 from unittest.mock import Mock, patch
 
-from bot import APIError, Bot, OpenSky, bounding_boxes, distance_km, format_report, nearby_aircraft
+from bot import APIError, Bot, FlightDetails, OpenSky, bounding_boxes, distance_km, format_report, nearby_aircraft
+from tracking import WatchStore
 
 
 NOW = 1_800_000_000
@@ -117,8 +120,9 @@ class BotTests(unittest.TestCase):
         self.provider = Mock()
         self.provider.nearby.return_value = (nearby_aircraft([state()], 38.73, -9.14, 50, NOW), NOW)
         self.bot = Bot("test-token", self.provider)
+        self.addCleanup(self.bot.store.db.close)
         self.bot.call = Mock()
-        self.message = {"chat": {"id": 123, "type": "private"},
+        self.message = {"chat": {"id": 123, "type": "private"}, "message_id": 42, "from": {"id": 456},
                         "location": {"latitude": 38.73, "longitude": -9.14}}
 
     def test_location_to_reply_flow(self):
@@ -148,15 +152,164 @@ class BotTests(unittest.TestCase):
         self.bot.handle({"message": self.message})
         self.assertIn("temporarily unavailable", self.bot.call.call_args.kwargs["text"])
 
-    def test_group_does_not_query_provider(self):
+    def test_group_member_cannot_change_watch(self):
         self.message["chat"]["type"] = "group"
+        self.bot.call.return_value = {"status": "member"}
         self.bot.handle({"message": self.message})
         self.provider.nearby.assert_not_called()
+
+    def test_group_admin_starts_watch_by_reply(self):
+        self.bot.username = "airways_bot"
+        self.bot.call.return_value = {"status": "administrator"}
+        self.bot.handle({"message": {"chat": {"id": -123, "type": "supergroup"},
+                                    "from": {"id": 456}, "text": "/watch@airways_bot",
+                                    "reply_to_message": self.message}})
+        self.assertEqual(self.bot.store.get(-123)["lat"], 38.73)
+        self.assertNotIn("reply_markup", self.bot.call.call_args.kwargs)
+        self.provider.nearby.assert_called_once()
+
+    def test_ordinary_group_conversation_is_ignored(self):
+        self.bot.handle({"message": {"chat": {"id": -123, "type": "group"}, "text": "Hello!"}})
+        self.bot.call.assert_not_called()
+
+    def test_command_for_another_bot_is_ignored(self):
+        self.bot.username = "airways_bot"
+        self.bot.handle({"message": {"chat": self.message["chat"], "text": "/stop@another_bot"}})
+        self.bot.call.assert_not_called()
+
+    def test_stop_deletes_watch_and_live_edits_cannot_restart_it(self):
+        self.bot.handle({"message": self.message})
+        self.bot.handle({"message": {"chat": self.message["chat"], "text": "/stop"}})
+        self.bot.handle({"edited_message": self.message})
+        self.assertIsNone(self.bot.store.get(123))
+        self.assertEqual(self.provider.nearby.call_count, 1)
+
+    def test_old_live_pin_cannot_move_replaced_watch(self):
+        self.bot.store.set_location(123, 40, 10, 50, location_message_id=99)
+        self.bot.handle({"edited_message": self.message})
+        self.assertEqual(self.bot.store.get(123)["lat"], 40)
+
+    def test_removing_bot_from_group_stops_watch(self):
+        self.bot.store.set_location(-123, 40, 10, 50)
+        self.bot.handle({"my_chat_member": {"chat": {"id": -123, "type": "supergroup"},
+                                           "new_chat_member": {"status": "kicked"}}})
+        self.assertIsNone(self.bot.store.get(-123))
 
     def test_invalid_location_does_not_query_provider(self):
         self.message["location"]["latitude"] = float("nan")
         self.bot.handle({"message": self.message})
         self.provider.nearby.assert_not_called()
+
+
+class MonitoringTests(unittest.TestCase):
+    def setUp(self):
+        self.provider = Mock()
+        self.store = WatchStore()
+        self.addCleanup(self.store.db.close)
+        self.bot = Bot("token", self.provider, store=self.store)
+        self.bot.send = Mock()
+        self.store.set_location(123, 38.73, -9.14, 50)
+
+    def tick(self, rows, now):
+        self.provider.nearby.return_value = (nearby_aircraft(rows, 38.73, -9.14, 50, NOW), now)
+        with patch("bot.time.time", return_value=now):
+            self.bot.check_watches()
+
+    def test_alerts_without_incoming_messages_and_deduplicates(self):
+        self.tick([state()], NOW)
+        self.tick([state()], NOW + 60)
+        self.assertEqual(self.bot.send.call_count, 1)
+        self.assertIn("Passing nearby", self.bot.send.call_args.args[1])
+        self.tick([state(), state("abc124")], NOW + 120)
+        self.assertEqual(self.bot.send.call_count, 2)
+        self.assertIn("abc124", self.bot.send.call_args.args[1])
+
+    def test_rearms_only_after_successfully_observed_absence(self):
+        self.tick([state()], NOW)
+        self.tick([], NOW + 60)
+        self.tick([state()], NOW + 120)
+        self.assertEqual(self.bot.send.call_count, 1)
+        self.tick([], NOW + 721)
+        self.tick([state()], NOW + 781)
+        self.assertEqual(self.bot.send.call_count, 2)
+
+    def test_provider_outage_does_not_reset_arrival_history(self):
+        self.tick([state()], NOW)
+        self.provider.nearby.side_effect = APIError(503)
+        with patch("bot.time.time", return_value=NOW + 700):
+            self.bot.check_watches()
+        self.provider.nearby.side_effect = None
+        self.tick([state()], NOW + 760)
+        self.assertEqual(self.bot.send.call_count, 1)
+
+    def test_failed_send_is_retried_on_next_check(self):
+        self.bot.send.side_effect = APIError(500)
+        self.tick([state()], NOW)
+        self.assertEqual(self.store.get(123)["seen"], {})
+        self.bot.send.side_effect = None
+        self.tick([state()], NOW + 60)
+        self.assertEqual(self.bot.send.call_count, 2)
+        self.assertIn("abc123", self.store.get(123)["seen"])
+
+    def test_telegram_rate_limit_pauses_alerts_globally(self):
+        self.bot.send.side_effect = APIError(429, 120)
+        self.tick([state()], NOW)
+        self.tick([state()], NOW + 60)
+        self.assertEqual(self.bot.send.call_count, 1)
+        self.bot.send.side_effect = None
+        self.tick([state()], NOW + 120)
+        self.assertEqual(self.bot.send.call_count, 2)
+
+    def test_removed_bot_watch_is_deleted(self):
+        self.bot.send.side_effect = APIError(403)
+        self.tick([state()], NOW)
+        self.assertIsNone(self.store.get(123))
+
+    def test_watches_and_duplicate_history_survive_restart(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = str(Path(directory) / "state.sqlite3")
+            store = WatchStore(path)
+            store.set_location(123, 38.73, -9.14, 50, 42)
+            watch = store.get(123)
+            watch["seen"] = {"abc123": NOW}
+            store.save(watch)
+            store.set_offset(12345)
+            store.db.close()
+            restored = WatchStore(path)
+            self.addCleanup(restored.db.close)
+            self.assertEqual(restored.offset(), 12345)
+            bot = Bot("token", self.provider, store=restored)
+            bot.send = Mock()
+            self.provider.nearby.return_value = (nearby_aircraft([state()], 38.73, -9.14, 50, NOW), NOW + 60)
+            with patch("bot.time.time", return_value=NOW + 60):
+                bot.check_watches()
+            bot.send.assert_not_called()
+
+
+class FlightDetailsTests(unittest.TestCase):
+    @patch("bot.request_json")
+    def test_type_and_route_with_midpoint_are_enriched_and_cached(self, request):
+        request.return_value = {"response": {"aircraft": {"type": "Airbus A320"},
+                                "flightroute": {"origin": {"iata_code": "LIS"},
+                                                "midpoint": {"iata_code": "MAD"},
+                                                "destination": {"icao_code": "EGLL"}}}}
+        details = FlightDetails()
+        for _ in range(2):
+            plane, = nearby_aircraft([state()], 38.73, -9.14, 50, NOW)
+            details.enrich(plane)
+            self.assertEqual(plane.aircraft_type, "Airbus A320")
+            self.assertEqual(plane.route, "LIS → MAD → EGLL")
+        self.assertEqual(request.call_count, 1)
+
+    @patch("bot.request_json", side_effect=APIError(404))
+    def test_missing_metadata_preserves_live_data(self, request):
+        plane, = nearby_aircraft([state()], 38.73, -9.14, 50, NOW)
+        FlightDetails().enrich_all([plane])
+        self.assertEqual(plane.route, "Unknown")
+        report = format_report([plane], 50, NOW)
+        self.assertIn("Altitude 9,100 m", report)
+        self.assertIn("Speed 720 km/h", report)
+        self.assertIn("Aircraft: Unknown", report)
 
 
 if __name__ == "__main__":
