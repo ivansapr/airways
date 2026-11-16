@@ -3,6 +3,9 @@
 !tracking.py
 !admin.py
 !access.py
+!flight_widget.py
+!widgets/
+!widgets/**
 !requirements.txt
 !admin_static/
 !admin_static/**

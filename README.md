@@ -92,6 +92,16 @@ The initial report shows up to eight nearest aircraft. Subsequent checks send in
 
 Watches, duplicate history, and Telegram update offsets are stored in SQLite. Keep the database on persistent storage. `/stop` deletes location and duplicate history, while aggregate chat activity remains visible in the dashboard. The bot also removes watches when Telegram reports that it was removed or blocked.
 
+## Animated Telegram flight board
+
+Private-chat alerts include an animated airport-style board beside the existing aircraft photo/text card. It shows the callsign on staggered flip-style tiles, full route city names, aircraft model, altitude, ground speed, distance, and the snapshot time. Tap **Replay board** to replay the local animation. Reduced-motion preferences disable animation. Light/dark styling follows Telegram's chat palette, and the layout fits compact message bubbles without internal scrolling.
+
+Set `TELEGRAM_WIDGETS=0` to disable the additional widget messages; the default is `1`. As documented by [Telegram Widgets](https://core.telegram.org/bots/widgets), production widgets currently work only in private chats. Group alerts retain their ordinary photo/text cards. Widget messages include a caption for clients that cannot render them. If the API rejects a widget, the already-delivered photo/text card remains available, with no duplicate alert retry. Unsupported-widget errors pause further widget attempts for one hour; Telegram rate-limit errors pause subsequent alert delivery.
+
+The widget is a snapshot, not a continuously refreshed display: the time shown belongs to that flight observation. Its animation and replay button are entirely local. It uses the same paid provider lookup and metadata as the alert; no additional flight-data calls, widget queries, refresh loop, or external assets are requested. Telegram widgets cannot load remote images, so real aircraft photos stay in the companion photo message. The widget never contains credentials, promo codes, or the user's location.
+
+The code lives in `widgets/flight_board.html` and is loaded by `flight_widget.py`. Its HTML is checked against Telegram's 32 KB raw / 4 KB zlib limits before sending, and its UTF-8 chat state is capped at 1 KB. This implementation uses 2D transforms, inline CSS/JavaScript/SVG, system fonts, and the native theme variables. Template edits apply to newly sent widgets; already sent messages keep their original code.
+
 ## Admin dashboard
 
 The dashboard refreshes every 15 seconds and includes:
@@ -138,4 +148,4 @@ python -m unittest discover -s tests -v
 node --check admin_static/admin.js
 ```
 
-The Python tests include local HTTP dashboard authentication/actions and mocked Telegram/provider flows, arrival deduplication, persistence, group permissions, missing metadata, aircraft photos and text fallbacks, city-name routes, partial-delivery retries, rate limits, date-line searches, polar bounds, promo redemption races/expiry/revocation, encrypted credential persistence, and protection against unauthorized owner-account usage. Live Telegram operation requires credentials and network access. API integration references: [Telegram Bot API](https://core.telegram.org/bots/api), [Telegram privacy-mode behavior](https://core.telegram.org/bots/faq), and the provider documentation above.
+The Python tests include local HTTP dashboard authentication/actions and mocked Telegram/provider flows, arrival deduplication, persistence, group permissions, missing metadata, aircraft photos and text fallbacks, city-name routes, partial-delivery retries, rate limits, date-line searches, polar bounds, promo redemption races/expiry/revocation, encrypted credential persistence, protection against unauthorized owner-account usage, widget payload limits, and widget delivery fallbacks. Live Telegram operation requires credentials and network access. API integration references: [Telegram Bot API](https://core.telegram.org/bots/api), [Telegram privacy-mode behavior](https://core.telegram.org/bots/faq), and the provider documentation above.

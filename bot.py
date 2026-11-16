@@ -1,4 +1,4 @@
-"""Airways: location-to-aircraft Telegram bot, using only the Python standard library."""
+"""Airways: nearby-flight alerts with per-chat API access and message widgets."""
 
 import html
 import json
@@ -16,6 +16,7 @@ from urllib.request import Request, urlopen
 
 from tracking import WatchStore
 from access import CredentialVault
+from flight_widget import widget_html, widget_data, widget_caption
 
 LOG = logging.getLogger("airways")
 EARTH_KM = 6371.0088
@@ -272,7 +273,7 @@ def format_report(aircraft, radius, timestamp, alert=False):
 
 
 class Bot:
-    def __init__(self, token, provider, radius=50, store=None, details=None, interval=60, vault=None):
+    def __init__(self, token, provider, radius=50, store=None, details=None, interval=60, vault=None, widgets_enabled=True):
         self.base = f"https://api.telegram.org/bot{token}/"
         self.provider, self.radius = provider, radius
         self.cooldowns = {}
@@ -284,6 +285,8 @@ class Bot:
         self.vault = vault
         self.customer_providers = {}
         self.activation_attempts = {}
+        self.widgets_enabled = widgets_enabled
+        self.widget_unavailable_until = 0
 
     def provider_for(self, chat_id):
         grant = self.store.get_access(chat_id)
@@ -408,6 +411,24 @@ class Bot:
         return self.call("sendMessage", **payload)
 
     def send_aircraft(self, chat_id, plane, radius, timestamp, alert=False):
+        result = self.send_aircraft_card(chat_id, plane, radius, timestamp, alert)
+        # Widgets supplement the delivered photo/text so older clients never lose the alert.
+        if self.widgets_enabled and chat_id > 0 and time.monotonic() >= self.widget_unavailable_until:
+            try:
+                self.call("sendWidget", chat_id=chat_id, html=widget_html(),
+                          chat_data=widget_data(plane, timestamp), caption=widget_caption(plane, timestamp),
+                          allow_queries=False, protect_content=True)
+            except APIError as error:
+                LOG.info("Message widget unavailable (status %s); flight card was delivered", error.status)
+                if error.status in (400, 404):
+                    self.widget_unavailable_until = time.monotonic() + 3600
+                elif error.status == 429:
+                    self.telegram_blocked_until = time.time() + error.retry_after
+            except (ValueError, OSError):
+                LOG.warning("Flight widget could not be built; flight card was delivered")
+        return result
+
+    def send_aircraft_card(self, chat_id, plane, radius, timestamp, alert=False):
         caption = format_report([plane], radius, timestamp, alert=alert)
         if plane.photo_url:
             try:
@@ -559,6 +580,8 @@ class Bot:
                    if aircraft else report)
         self.send(chat_id, "<b>Nearby-flight alerts are active.</b> Use /stop to stop and delete the saved location.\n\n" + summary)
         for plane in aircraft[:8]:
+            if time.time() < self.telegram_blocked_until:
+                break
             if not self.store.get(chat_id):
                 break
             self.send_aircraft(chat_id, plane, self.radius, timestamp)
@@ -570,6 +593,8 @@ class Bot:
         if time.time() < self.telegram_blocked_until:
             return
         for watch in self.store.due(time.time()):
+            if time.time() < self.telegram_blocked_until:
+                return
             chat_id = watch["chat_id"]
             watch["next_check"] = time.time() + self.interval
             provider = self.provider_for(chat_id)
@@ -595,6 +620,8 @@ class Bot:
             if self.details and arrivals:
                 self.details.enrich_all(arrivals)
             for plane in arrivals:
+                if time.time() < self.telegram_blocked_until:
+                    return
                 try:
                     if not self.store.get(chat_id):
                         continue
@@ -692,7 +719,8 @@ def main():
             from admin import start_admin
             admin_server = start_admin(os.environ.get("STATE_DB_PATH", "data/airways.sqlite3"))
         owner_provider = OpenSky(client_id, client_secret) if client_id else None
-        Bot(token, owner_provider, radius, store, FlightDetails(), interval, vault=vault).run()
+        Bot(token, owner_provider, radius, store, FlightDetails(), interval, vault=vault,
+            widgets_enabled=os.environ.get("TELEGRAM_WIDGETS", "1") != "0").run()
     except KeyboardInterrupt:
         LOG.info("Airways stopped")
     except APIError as error:
