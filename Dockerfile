@@ -1,6 +1,8 @@
 FROM python:3.13-slim
 WORKDIR /app
-COPY bot.py tracking.py admin.py ./
+COPY requirements.txt ./
+RUN pip install --no-cache-dir -r requirements.txt
+COPY bot.py tracking.py admin.py access.py ./
 COPY admin_static ./admin_static
 RUN mkdir /data && chown 65534:65534 /data
 USER 65534:65534

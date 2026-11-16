@@ -37,17 +37,29 @@ function renderChats() {
     text.append(el('span', 'chat-title', chat.title), el('span', 'chat-id', `${chat.kind} · ${chat.chat_id}`));
     identity.append(text); name.append(identity);
     const status = el('td');
-    status.append(el('span', `badge${chat.watching ? '' : ' paused'}`, chat.watching ? '● Watching' : 'Inactive'));
-    const location = el('td', '', chat.watching ? `${chat.lat.toFixed(3)}, ${chat.lon.toFixed(3)}` : '—');
-    if (chat.watching) location.append(el('span', 'cell-sub', `${chat.radius} km radius`));
+    status.append(el('span', `badge${chat.watching ? '' : ' paused'}`, chat.watching ? '● Watching' : chat.watch_paused ? 'Watch paused' : 'Inactive'));
+    const accessLabel = {own: 'Own API credentials', promo: 'Owner API · promo', locked: 'Activation required'};
+    status.append(el('span', 'cell-sub', accessLabel[chat.access_mode] || 'Activation required'));
+    if (chat.access_expires_at) status.append(el('span', 'cell-sub', `Until ${new Date(chat.access_expires_at * 1000).toLocaleDateString()}`));
+    const location = el('td', '', chat.watching || chat.watch_paused ? `${chat.lat.toFixed(3)}, ${chat.lon.toFixed(3)}` : '—');
+    if (chat.watching || chat.watch_paused) location.append(el('span', 'cell-sub', `${chat.radius} km radius`));
     const usage = el('td', '', `${number(chat.alerts)} alerts`);
     usage.append(el('span', 'cell-sub', `${number(chat.updates)} updates`));
     const activity = el('td', '', ago(chat.last_seen));
     const actions = el('td');
-    if (chat.watching) {
+    if (chat.watching || chat.watch_paused) {
       const button = el('button', 'stop', 'Stop watch');
       button.addEventListener('click', () => stopWatch(chat));
       actions.append(button);
+    }
+    if (chat.access_mode && chat.access_mode !== 'locked') {
+      const revoke = el('button', 'stop revoke-access', 'Revoke access');
+      revoke.addEventListener('click', async () => {
+        if (!confirm(`Remove API access, saved credentials, and the watch for ${chat.title}?`)) return;
+        try { await mutate('/api/revoke-access', {chat_id: chat.chat_id}); await refresh(); }
+        catch (error) { showError(error); }
+      });
+      actions.append(revoke);
     }
     tr.append(name, status, location, usage, activity, actions);
     $('chat-rows').append(tr);
@@ -97,6 +109,30 @@ function render() {
   });
   $('week-updates').textContent = number(weeklyUpdates);
   renderChats();
+  renderPromos();
+}
+function renderPromos() {
+  const promos = state.promos || [];
+  $('promo-rows').replaceChildren();
+  $('promos-empty').hidden = promos.length > 0;
+  for (const promo of promos) {
+    const row = el('tr');
+    const status = !promo.enabled ? 'Revoked' : promo.redeem_until < Date.now() / 1000 ? 'Expired' : promo.uses >= promo.max_uses ? 'Fully used' : 'Available';
+    const action = el('td');
+    if (promo.enabled) {
+      const button = el('button', 'stop', 'Revoke');
+      button.addEventListener('click', async () => {
+        if (!confirm(`Revoke ${promo.label}? Chats using this invitation will lose access to your API account.`)) return;
+        try { await mutate('/api/revoke-promo', {id: promo.id}); await refresh(); }
+        catch (error) { showError(error); }
+      });
+      action.append(button);
+    }
+    row.append(el('td', '', promo.label), el('td', '', `${promo.uses} / ${promo.max_uses}`),
+      el('td', '', new Date(promo.redeem_until * 1000).toLocaleDateString()),
+      el('td', '', `${promo.grant_days} days`), el('td', '', status), action);
+    $('promo-rows').append(row);
+  }
 }
 async function refresh() {
   if (busy) return;
@@ -112,7 +148,8 @@ async function refresh() {
 async function mutate(path, body) {
   const response = await fetch(path, {method: 'POST', headers: {'Content-Type': 'application/json', 'X-CSRF-Token': state.csrf}, body: JSON.stringify(body)});
   if (response.status === 401) { location.reload(); throw new Error('Please sign in again.'); }
-  if (!response.ok) throw new Error('The action failed. Refresh and try again.');
+  if (!response.ok) throw new Error(await response.text() || 'The action failed. Refresh and try again.');
+  return response.headers.get('content-type')?.includes('application/json') ? response.json() : null;
 }
 function showError(error) { $('error').textContent = error.message; $('error').hidden = false; }
 function stopWatch(chat) {
@@ -133,6 +170,22 @@ document.querySelectorAll('[data-filter]').forEach(button => button.addEventList
   if (state) renderChats();
 }));
 $('refresh').addEventListener('click', refresh);
+$('promo-form').addEventListener('submit', async event => {
+  event.preventDefault();
+  if (!state) return;
+  const button = event.target.querySelector('button');
+  button.disabled = true;
+  try {
+    const result = await mutate('/api/promos', Object.fromEntries(new FormData(event.target)));
+    $('promo-code').value = result.code; $('new-promo').hidden = false;
+    $('copy-promo').textContent = 'Copy'; await refresh();
+  } catch (error) { showError(error); }
+  finally { button.disabled = false; }
+});
+$('copy-promo').addEventListener('click', async () => {
+  try { await navigator.clipboard.writeText($('promo-code').value); $('copy-promo').textContent = 'Copied'; }
+  catch { $('promo-code').select(); }
+});
 $('logout').addEventListener('click', async () => {
   if (!state) return;
   try { await mutate('/logout', {}); location.reload(); } catch (error) { showError(error); }

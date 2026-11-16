@@ -1,6 +1,8 @@
 """Persistent chat watches. Accessed by the bot's single polling thread."""
 
 import json
+import hashlib
+import secrets
 import sqlite3
 import time
 from datetime import datetime, timezone
@@ -26,6 +28,14 @@ class WatchStore:
             first_seen REAL, last_seen REAL, updates INTEGER DEFAULT 0, alerts INTEGER DEFAULT 0)""")
         self.db.execute("""CREATE TABLE IF NOT EXISTS metrics (
             day TEXT, name TEXT, value INTEGER DEFAULT 0, PRIMARY KEY (day, name))""")
+        self.db.execute("""CREATE TABLE IF NOT EXISTS promos (
+            id INTEGER PRIMARY KEY, code_hash TEXT UNIQUE, label TEXT, max_uses INTEGER,
+            redeem_until REAL, grant_days INTEGER, enabled INTEGER DEFAULT 1, created_at REAL)""")
+        self.db.execute("""CREATE TABLE IF NOT EXISTS redemptions (
+            promo_id INTEGER, chat_id INTEGER, redeemed_at REAL, PRIMARY KEY(promo_id, chat_id))""")
+        self.db.execute("""CREATE TABLE IF NOT EXISTS access (
+            chat_id INTEGER PRIMARY KEY, mode TEXT, credentials TEXT,
+            promo_id INTEGER, expires_at REAL, configured_by INTEGER)""")
         self.db.commit()
 
     def get(self, chat_id):
@@ -96,10 +106,74 @@ class WatchStore:
             FROM chats c LEFT JOIN watches w ON c.chat_id=w.chat_id ORDER BY c.last_seen DESC""")]
         metrics = [dict(row) for row in self.db.execute("SELECT * FROM metrics ORDER BY day")]
         heartbeat = self.db.execute("SELECT value FROM settings WHERE key='heartbeat'").fetchone()
-        return dict(chats=chats, metrics=metrics, heartbeat=heartbeat[0] if heartbeat else None,
-                    active_watches=self.db.execute("SELECT COUNT(*) FROM watches").fetchone()[0],
+        for chat in chats:
+            grant = self.get_access(chat["chat_id"])
+            chat["access_mode"] = grant["mode"] if grant else "locked"
+            chat["access_expires_at"] = grant["expires_at"] if grant else None
+            chat["watch_paused"] = bool(chat["watching"] and not grant)
+            chat["watching"] = int(bool(chat["watching"] and grant))
+        promos = [dict(row) for row in self.db.execute("""SELECT p.id, p.label, p.max_uses,
+            p.redeem_until, p.grant_days, p.enabled, COUNT(r.chat_id) AS uses
+            FROM promos p LEFT JOIN redemptions r ON r.promo_id=p.id GROUP BY p.id ORDER BY p.id DESC""")]
+        return dict(chats=chats, metrics=metrics, promos=promos, heartbeat=heartbeat[0] if heartbeat else None,
+                    active_watches=sum(chat["watching"] for chat in chats),
                     generated_at=time.time())
 
     def heartbeat(self):
         with self.db:
             self.db.execute("INSERT OR REPLACE INTO settings VALUES ('heartbeat', ?)", (int(time.time()),))
+
+    def create_promo(self, label, max_uses=1, redeem_days=7, grant_days=30):
+        if not (1 <= max_uses <= 10000 and 1 <= redeem_days <= 365 and 1 <= grant_days <= 365):
+            raise ValueError("Use limits must be 1–10000; expiry and access days must be 1–365.")
+        code = "AIR-" + secrets.token_hex(12).upper()
+        digest = hashlib.sha256(code.encode()).hexdigest()
+        with self.db:
+            cursor = self.db.execute("""INSERT INTO promos
+                (code_hash, label, max_uses, redeem_until, grant_days, created_at) VALUES (?, ?, ?, ?, ?, ?)""",
+                (digest, str(label).strip()[:80] or "Promo", max_uses, time.time() + redeem_days * 86400, grant_days, time.time()))
+        return dict(id=cursor.lastrowid, code=code)
+
+    def redeem(self, code, chat_id, user_id):
+        digest = hashlib.sha256(code.strip().upper().encode()).hexdigest()
+        now = time.time()
+        # Serialize redemption with revocation/other users so usage limits cannot be raced.
+        with self.db:
+            self.db.execute("BEGIN IMMEDIATE")
+            promo = self.db.execute("SELECT * FROM promos WHERE code_hash=?", (digest,)).fetchone()
+            if not promo or not promo["enabled"] or promo["redeem_until"] <= now:
+                return False
+            used = self.db.execute("SELECT 1 FROM redemptions WHERE promo_id=? AND chat_id=?", (promo["id"], chat_id)).fetchone()
+            if used:
+                return False  # Replaying a code never extends or restores a grant.
+            count = self.db.execute("SELECT COUNT(*) FROM redemptions WHERE promo_id=?", (promo["id"],)).fetchone()[0]
+            if count >= promo["max_uses"]:
+                return False
+            self.db.execute("INSERT INTO redemptions VALUES (?, ?, ?)", (promo["id"], chat_id, now))
+            self.db.execute("INSERT OR REPLACE INTO access VALUES (?, 'promo', NULL, ?, ?, ?)",
+                            (chat_id, promo["id"], now + promo["grant_days"] * 86400, user_id))
+        return True
+
+    def set_credentials(self, chat_id, ciphertext, user_id):
+        with self.db:
+            self.db.execute("INSERT OR REPLACE INTO access VALUES (?, 'own', ?, NULL, NULL, ?)",
+                            (chat_id, ciphertext, user_id))
+
+    def get_access(self, chat_id):
+        row = self.db.execute("SELECT * FROM access WHERE chat_id=?", (chat_id,)).fetchone()
+        if not row or (row["expires_at"] is not None and row["expires_at"] <= time.time()):
+            return None
+        if row["mode"] == "promo":
+            promo = self.db.execute("SELECT enabled FROM promos WHERE id=?", (row["promo_id"],)).fetchone()
+            if not promo or not promo["enabled"]:
+                return None
+        return dict(row)
+
+    def revoke_access(self, chat_id):
+        with self.db:
+            self.db.execute("DELETE FROM access WHERE chat_id=?", (chat_id,))
+            self.db.execute("DELETE FROM watches WHERE chat_id=?", (chat_id,))
+
+    def revoke_promo(self, promo_id):
+        with self.db:
+            self.db.execute("UPDATE promos SET enabled=0 WHERE id=?", (promo_id,))

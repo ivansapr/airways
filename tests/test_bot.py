@@ -11,6 +11,12 @@ from tracking import WatchStore
 NOW = 1_800_000_000
 
 
+def authorize(store, *chat_ids):
+    promo = store.create_promo("Test", max_uses=len(chat_ids), grant_days=365)
+    for chat_id in chat_ids:
+        assert store.redeem(promo["code"], chat_id, 456)
+
+
 def state(icao="abc123", lat=38.73, lon=-9.14, **fields):
     row = [icao, "TAP123  ", "Portugal", NOW - 5, NOW, lon, lat,
            9000, False, 200, 270, 0, None, 9100, None, False, 0]
@@ -121,6 +127,7 @@ class BotTests(unittest.TestCase):
         self.provider = Mock()
         self.provider.nearby.return_value = (nearby_aircraft([state()], 38.73, -9.14, 50, NOW), NOW)
         self.bot = Bot("test-token", self.provider)
+        authorize(self.bot.store, 123, -123)
         self.addCleanup(self.bot.store.db.close)
         self.bot.call = Mock()
         self.message = {"chat": {"id": 123, "type": "private"}, "message_id": 42, "from": {"id": 456},
@@ -234,6 +241,7 @@ class MonitoringTests(unittest.TestCase):
     def setUp(self):
         self.provider = Mock()
         self.store = WatchStore()
+        authorize(self.store, 123)
         self.addCleanup(self.store.db.close)
         self.bot = Bot("token", self.provider, store=self.store)
         self.bot.send = Mock()
@@ -307,6 +315,7 @@ class MonitoringTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             path = str(Path(directory) / "state.sqlite3")
             store = WatchStore(path)
+            authorize(store, 123)
             store.set_location(123, 38.73, -9.14, 50, 42)
             watch = store.get(123)
             watch["seen"] = {"abc123": NOW}

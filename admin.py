@@ -171,6 +171,26 @@ class AdminHandler(BaseHTTPRequestHandler):
             finally:
                 store.db.close()
             self.respond(200, '{"ok":true}', "application/json")
+        elif path in ("/api/promos", "/api/revoke-promo", "/api/revoke-access"):
+            store = WatchStore(self.server.db_path)
+            try:
+                data = json.loads(body)
+                if not isinstance(data, dict):
+                    raise ValueError("Invalid request")
+                result = {"ok": True}
+                if path == "/api/promos":
+                    result = store.create_promo(data.get("label", ""), int(data.get("max_uses", 1)),
+                                                int(data.get("redeem_days", 7)), int(data.get("grant_days", 30)))
+                elif path == "/api/revoke-promo":
+                    store.revoke_promo(int(data["id"]))
+                else:
+                    store.revoke_access(int(data["chat_id"]))
+            except (ValueError, KeyError, TypeError):
+                self.respond(400, "Invalid fields. Uses: 1–10000; days: 1–365.")
+                return
+            finally:
+                store.db.close()
+            self.respond(200, json.dumps(result), "application/json")
         else:
             self.respond(404, "Not found")
 

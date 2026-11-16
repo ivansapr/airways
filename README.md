@@ -4,15 +4,26 @@ Send a location to the Telegram bot to start live nearby-flight alerts. Airways 
 
 Each aircraft gets its own flight card with a photo when available, callsign, full route city names, readable aircraft name (for example, Boeing 737-800), distance, altitude, speed, and map/tracker links. Heading, position age, ICAO address, and registered country are omitted from the displayed card. Live positions come from OpenSky; route and aircraft details are looked up with adsbdb. Missing details appear as **Unknown**. Routes are callsign-based database matches, not a verified live itinerary, and can be outdated.
 
-A password-protected admin dashboard shows usage, chats, active watches, and bot health. No external Python packages are required. Python 3.10+ is supported.
+A password-protected admin dashboard shows usage, chats, active watches, and bot health. Python 3.10+ is supported. The cryptography package encrypts customer API credentials at rest.
 
 ## Setup
 
 1. Create a bot with [@BotFather](https://t.me/BotFather) using `/newbot`.
 2. Copy `.env.example` to `.env`, then set `TELEGRAM_BOT_TOKEN`.
 3. Set `ADMIN_PASSWORD` to enable the dashboard. Leave it empty to disable it.
-4. Optionally set both `OPENSKY_CLIENT_ID` and `OPENSKY_CLIENT_SECRET` from your [OpenSky account](https://opensky-network.org/my-opensky/account). These are OAuth2 API client credentials, not your account password.
-5. Load your environment and run:
+4. Set `OPENSKY_CLIENT_ID` and `OPENSKY_CLIENT_SECRET` from your [OpenSky account](https://opensky-network.org/my-opensky/account) if you want promo-code chats to use your account. These are OAuth2 API client credentials, not your account password. Leaving both empty disables owner-funded access.
+5. Install dependencies and generate a credential-encryption key once:
+
+```sh
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+python -c 'from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())'
+```
+
+Save the generated key as `CREDENTIAL_ENCRYPTION_KEY` in `.env` or Coolify. Keep it stable across restarts, and back it up separately from the database. If it is absent, promo codes still work, but own-credential setup is disabled.
+
+6. Load your environment and run:
 
 ```sh
 set -a
@@ -31,12 +42,12 @@ python3 admin.py
 
 ## Using the bot
 
-In a private chat, send `/start` and tap **Share my location**, or use **Attach → Location**. Sharing a pin immediately starts a persistent watch, returns current aircraft, and enables arrival alerts. A location message is enough; you do not need to keep sharing a live location.
+Activate the chat first (see below). In a private chat, send `/start` and tap **Share my location**, or use **Attach → Location**. Sharing a pin immediately starts a persistent watch, returns current aircraft, and enables arrival alerts. A location message is enough; you do not need to keep sharing a live location.
 
 For groups:
 
 1. Add the bot and promote it to administrator so Telegram reliably delivers location messages and administrator checks.
-2. A group administrator sends a location pin, or replies to an existing pin with `/watch@YourBotUsername`.
+2. A group administrator activates the group using a promo code or connects credentials privately, then sends a location pin or replies to an existing pin with `/watch@YourBotUsername`.
 3. Alerts are delivered to the group. Only group administrators can change the location or stop the watch.
 
 The location-request keyboard is available in private chats only. With Telegram privacy mode enabled and the bot not promoted, use an explicitly addressed `/watch@YourBotUsername` command replying to a map pin. Do not use anonymous administrator mode when configuring a watch: the bot verifies the sender's user ID. The bot ignores ordinary group conversation.
@@ -46,9 +57,32 @@ The location-request keyboard is available in private chats only. With Telegram 
 | `/start`, `/help` | Show location-sharing instructions |
 | `/watch` | Reply to a map pin to start or move a watch |
 | `/status` | Show whether this chat has an active watch |
-| `/stop` | Stop alerts and delete the chat's saved watch location |
+| `/stop` | Stop alerts and delete the chat's saved watch location; retain access |
+| `/promo CODE` | Redeem an invitation for this chat |
+| `/credentials CLIENT_ID CLIENT_SECRET` | Connect own OpenSky credentials in a private chat |
+| `/credentials GROUP_ID CLIENT_ID CLIENT_SECRET` | Privately connect credentials for a group you administer |
+| `/access` | Show this chat's access mode and promo expiry |
+| `/disconnect` | Remove access, encrypted credentials, and watch |
+| `/disconnect GROUP_ID` | Privately remove a group's access as its credential owner or administrator |
 
 Live-location edits update the active watch, at most once every 15 seconds. Once sharing expires, monitoring continues around its last position until `/stop`. Edits to stopped or replaced pins cannot reactivate the watch.
+
+## Activation and promo codes
+
+**Every chat requires activation, including chats with watches created by earlier versions.** There is no automatic owner-account or anonymous fallback. Unactivated, expired, or revoked chats make no flight-data or aircraft-metadata requests. Existing watches remain paused until the chat activates again; `/stop` still deletes a paused watch.
+
+Users choose one of two options:
+
+- **Use your account:** In the admin dashboard, create an invitation under **Promo codes**, copy the code shown once, and share it with the intended recipient. The recipient sends `/promo CODE` in the private chat or group to activate. A group administrator must redeem it. A code grants access only to the redeeming chat, not every group the user joins.
+- **Use their account:** The user sends `/credentials CLIENT_ID CLIENT_SECRET` in a private chat with the bot. For a group, a group administrator privately sends `/credentials GROUP_ID CLIENT_ID CLIENT_SECRET`; the group ID appears in the activation instructions. The bot validates the credentials through OpenSky OAuth before storing them. Credentials are never accepted from group messages.
+
+Codes default to one chat, a seven-day redemption deadline, and thirty days of access starting at redemption. Configure these fields when issuing a code. The redemption deadline does not shorten an already issued access grant. Redemptions are atomic so concurrent users cannot exceed a code's chat limit. Replaying a code in the same chat does not renew or restore access; use a new code to renew. Failed activation attempts are throttled.
+
+Revoke an invitation in the dashboard to disable owner access for every chat currently using it, or use **Revoke access** on a particular chat to remove its access, stored credentials, and watch. Users can do the same through `/disconnect`. Expiry/revocation is checked before each search; requests already in progress may finish. Promo codes authorize use of your API allowance; they do not buy provider credits or guarantee capacity within your provider quota.
+
+User credentials are encrypted with Fernet before entering SQLite. Raw codes are stored only as hashes; the full code is returned once when created and cannot be recovered from the dashboard. Neither credentials nor encrypted credential values are included in dashboard responses or application logs. Each credential-backed chat has its own OAuth client/token and rate-limit handling; failures never switch it onto the owner's account. Changing or losing the encryption key requires affected users to reconnect their credentials. `/stop` preserves access for reuse, while `/disconnect` deletes access and the saved watch.
+
+Credential commands pass through Telegram private messages; the bot attempts to delete the command immediately but deletion can fail. It never echoes secrets. If credentials were accidentally posted in a group, rotate them at OpenSky. Removing/blocking the bot removes the chat's access and saved credentials when Telegram delivers the membership update.
 
 ## Arrival alerts
 
@@ -88,19 +122,20 @@ Run one bot instance per Telegram token. Long polling requires outbound HTTPS, a
 
 ## Data sources, quotas, and privacy
 
-Aircraft positions use the [OpenSky REST API](https://openskynetwork.github.io/opensky-api/rest.html). Each active watch normally consumes one states query per interval, or two near the date line. At 60-second intervals, a continuously running watch needs about 1,440 queries per day, plus initial searches. Anonymous access has a much smaller allowance; use OAuth credentials and an interval appropriate to your quota and chat count. Rate-limit responses pause queries until the provider permits retries. There is no guarantee that a free quota supports every watch all day.
+Aircraft positions use the [OpenSky REST API](https://openskynetwork.github.io/opensky-api/rest.html). Each active watch normally consumes one states query per interval, or two near the date line. At 60-second intervals, a continuously running watch needs about 1,440 queries per day, plus initial searches. Use OAuth credentials and an interval appropriate to the credential owner's quota and chat count. Anonymous access is disabled by the bot's activation gate. Rate-limit responses pause queries until the provider permits retries. There is no guarantee that a free quota supports every watch all day.
 
 Searches use great-circle horizontal distance, exclude ground positions, and discard positions older than two minutes. Coverage is incomplete: an empty response does not necessarily mean an empty sky. Altitude uses geometric altitude when available, otherwise barometric altitude, in metres; speed is ground speed in km/h. Transponder addresses and position age are still used internally to identify aircraft and discard stale data, but are not displayed.
 
 [adsbdb](https://www.adsbdb.com/) supplies aircraft type, manufacturer, photo URLs, and origin/destination city names, with an intermediate city when supplied. City labels use the airport municipality; when it is missing, the full airport name is used, otherwise Unknown. Photos are looked up for the particular aircraft, not generated or substituted with an unrelated plane. Lookups use public aircraft identifiers and callsigns; a short-lived, bounded in-memory cache reduces repeat requests. Route information is not copied into the persistent database. Review [OpenSky's terms](https://opensky-network.org/about/terms-of-use) and [adsbdb's data-source notes](https://github.com/FugginOld/adsb-db) for your use.
 
-SQLite stores chat IDs, display names/titles, chat type, aggregate counts, activity timestamps, and active watch coordinates/history. The bot does not store message contents or log location coordinates. Search areas are sent to OpenSky, aircraft identifiers are sent to adsbdb, and Telegram processes bot messages under its own policies. The database is ignored by Git and excluded from Docker build context.
+SQLite stores chat IDs, display names/titles, chat type, aggregate counts, activity timestamps, active watch coordinates/history, access grants, encrypted API credentials, hashed promo codes, and redemption records. The bot does not store message contents or log location coordinates. Search areas are sent to OpenSky, aircraft identifiers are sent to adsbdb, and Telegram processes bot messages under its own policies. The database is ignored by Git and excluded from Docker build context.
 
 ## Verification
 
 ```sh
-python3 -m unittest discover -s tests -v
+source .venv/bin/activate
+python -m unittest discover -s tests -v
 node --check admin_static/admin.js
 ```
 
-The Python tests include local HTTP dashboard authentication/actions and mocked Telegram/provider flows, arrival deduplication, persistence, group permissions, missing metadata, aircraft photos and text fallbacks, city-name routes, partial-delivery retries, rate limits, date-line searches, and polar bounds. Live Telegram operation requires credentials and network access. API integration references: [Telegram Bot API](https://core.telegram.org/bots/api), [Telegram privacy-mode behavior](https://core.telegram.org/bots/faq), and the provider documentation above.
+The Python tests include local HTTP dashboard authentication/actions and mocked Telegram/provider flows, arrival deduplication, persistence, group permissions, missing metadata, aircraft photos and text fallbacks, city-name routes, partial-delivery retries, rate limits, date-line searches, polar bounds, promo redemption races/expiry/revocation, encrypted credential persistence, and protection against unauthorized owner-account usage. Live Telegram operation requires credentials and network access. API integration references: [Telegram Bot API](https://core.telegram.org/bots/api), [Telegram privacy-mode behavior](https://core.telegram.org/bots/faq), and the provider documentation above.

@@ -63,8 +63,9 @@ class AdminTests(unittest.TestCase):
         status, _, body = self.request("GET", "/api/overview", headers=headers)
         data = json.loads(body)
         self.assertEqual(status, 200)
-        self.assertEqual(data["chats"][0]["title"], "<script>hello</script>")
-        self.assertEqual(data["chats"][0]["alerts"], 1)
+        chat = next(chat for chat in data["chats"] if chat["chat_id"] == -123)
+        self.assertEqual(chat["title"], "<script>hello</script>")
+        self.assertEqual(chat["alerts"], 1)
         self.assertEqual(next(row["value"] for row in data["metrics"] if row["name"] == "flight_lookups"), 4)
         self.assertIn("csrf", data)
 
@@ -104,3 +105,40 @@ class AdminTests(unittest.TestCase):
 
     def test_oversized_request_is_rejected(self):
         self.assertEqual(self.request("POST", "/login", "x" * 2049)[0], 400)
+
+    def test_create_promo_and_revoke_require_auth_and_csrf(self):
+        self.assertEqual(self.request("POST", "/api/promos", "{}")[0], 401)
+        headers, token = self.login()
+        self.assertEqual(self.request("POST", "/api/promos", "{}", headers)[0], 403)
+        headers["X-CSRF-Token"] = token
+        status, _, body = self.request("POST", "/api/promos", json.dumps({"label": "Friends", "max_uses": 2}), headers)
+        self.assertEqual(status, 200)
+        promo = json.loads(body)
+        self.assertTrue(promo["code"].startswith("AIR-"))
+        store = WatchStore(self.path)
+        self.addCleanup(store.db.close)
+        self.assertTrue(store.redeem(promo["code"], 777, 777))
+        _, _, overview = self.request("GET", "/api/overview", headers=headers)
+        self.assertNotIn(promo["code"].encode(), overview)
+        self.assertEqual(self.request("POST", "/api/revoke-promo", json.dumps({"id": promo["id"]}), headers)[0], 200)
+        self.assertIsNone(store.get_access(777))
+
+    def test_invalid_promo_limits_are_rejected(self):
+        headers, token = self.login()
+        headers["X-CSRF-Token"] = token
+        for body in ('{"max_uses":0}', '{"grant_days":0}', '{"redeem_days":999}', '[]'):
+            self.assertEqual(self.request("POST", "/api/promos", body, headers)[0], 400)
+
+    def test_admin_can_revoke_customer_credentials_without_reading_them(self):
+        store = WatchStore(self.path)
+        self.addCleanup(store.db.close)
+        store.record_chat({"id": 888, "type": "private"})
+        store.set_credentials(888, "encrypted-customer-secret", 888)
+        store.set_location(888, 38, -9, 50)
+        headers, token = self.login()
+        headers["X-CSRF-Token"] = token
+        _, _, overview = self.request("GET", "/api/overview", headers=headers)
+        self.assertNotIn(b"encrypted-customer-secret", overview)
+        self.assertEqual(self.request("POST", "/api/revoke-access", '{"chat_id":888}', headers)[0], 200)
+        self.assertIsNone(store.get_access(888))
+        self.assertIsNone(store.get(888))

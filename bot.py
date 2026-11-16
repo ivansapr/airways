@@ -15,6 +15,7 @@ from urllib.parse import urlencode, urlsplit
 from urllib.request import Request, urlopen
 
 from tracking import WatchStore
+from access import CredentialVault
 
 LOG = logging.getLogger("airways")
 EARTH_KM = 6371.0088
@@ -271,7 +272,7 @@ def format_report(aircraft, radius, timestamp, alert=False):
 
 
 class Bot:
-    def __init__(self, token, provider, radius=50, store=None, details=None, interval=60):
+    def __init__(self, token, provider, radius=50, store=None, details=None, interval=60, vault=None):
         self.base = f"https://api.telegram.org/bot{token}/"
         self.provider, self.radius = provider, radius
         self.cooldowns = {}
@@ -280,6 +281,118 @@ class Bot:
         self.interval = interval
         self.username = ""
         self.telegram_blocked_until = 0
+        self.vault = vault
+        self.customer_providers = {}
+        self.activation_attempts = {}
+
+    def provider_for(self, chat_id):
+        grant = self.store.get_access(chat_id)
+        if not grant:
+            self.customer_providers.pop(chat_id, None)
+            return None
+        if grant["mode"] == "promo":
+            self.customer_providers.pop(chat_id, None)
+            return self.provider
+        if not self.vault:
+            return None
+        cached = self.customer_providers.get(chat_id)
+        if cached and cached[0] == grant["credentials"]:
+            return cached[1]
+        try:
+            client_id, secret = self.vault.open(grant["credentials"])
+        except ValueError:
+            return None
+        provider = OpenSky(client_id, secret)
+        if len(self.customer_providers) >= 1024:
+            self.customer_providers.clear()
+        self.customer_providers[chat_id] = (grant["credentials"], provider)
+        return provider
+
+    def activation_help(self, chat_id):
+        target = f"{chat_id} " if chat_id < 0 else ""
+        return ("<b>Activate flight data first</b>\n"
+                "Redeem a code from the bot owner here: <code>/promo YOUR_CODE</code>\n\n"
+                "Or send your own OpenSky API client credentials to me in a <b>private chat</b>:\n"
+                f"<code>/credentials {target}CLIENT_ID CLIENT_SECRET</code>\n"
+                "Group activation requires a group administrator. Never post API secrets in a group.\n"
+                "Use /access to check access or /disconnect to remove it.")
+
+    def activation_allowed(self, user_id):
+        now = time.monotonic()
+        self.activation_attempts = {key: values for key, values in self.activation_attempts.items()
+                                    if values and values[-1] > now - 60}
+        values = [stamp for stamp in self.activation_attempts.get(user_id, []) if stamp > now - 60]
+        if len(values) >= 5:
+            return False
+        self.activation_attempts[user_id] = values + [now]
+        return True
+
+    def handle_credentials(self, message, args):
+        chat_id = message["chat"]["id"]
+        try:
+            self.call("deleteMessage", chat_id=chat_id, message_id=message["message_id"])
+        except APIError:
+            pass
+        if message["chat"]["type"] != "private":
+            self.send(chat_id, "Send API credentials only in a private chat with me. If you posted a secret here, rotate it in OpenSky.")
+            return
+        if not self.vault:
+            self.send(chat_id, "Credential setup is not configured by the bot owner yet. You can redeem a promo code instead.")
+            return
+        parts = args.split()
+        target = chat_id
+        if len(parts) == 3:
+            try:
+                target = int(parts.pop(0))
+            except ValueError:
+                target = 0
+            if target >= 0:
+                self.send(chat_id, "The optional target must be a group chat ID.\n" + self.activation_help(chat_id))
+                return
+            member = self.call("getChatMember", chat_id=target, user_id=message["from"]["id"])
+            if member.get("status") not in ("administrator", "creator"):
+                self.send(chat_id, "Only an administrator of that group can configure its credentials.")
+                return
+        if len(parts) != 2 or any(len(part) > 512 for part in parts):
+            self.send(chat_id, self.activation_help(chat_id))
+            return
+        if not self.activation_allowed(message["from"]["id"]):
+            self.send(chat_id, "Too many activation attempts. Please wait one minute.")
+            return
+        client_id, secret = parts
+        provider = OpenSky(client_id, secret)
+        try:
+            provider.headers()  # Validate OAuth without using the owner's data allowance.
+        except APIError:
+            self.send(chat_id, "Could not verify those OpenSky API client credentials. Check them and try again later.")
+            return
+        self.store.set_credentials(target, self.vault.seal(client_id, secret), message["from"]["id"])
+        self.customer_providers.pop(target, None)
+        self.send(chat_id, f"Own API credentials connected for chat <code>{target}</code>. Send a location in that chat to start alerts. "
+                  "Use /disconnect to delete credentials for this chat, or /disconnect GROUP_ID for a group.")
+
+    def disconnect(self, message, args):
+        chat_id = message["chat"]["id"]
+        target = chat_id
+        if args:
+            try:
+                target = int(args)
+            except ValueError:
+                self.send(chat_id, "Use /disconnect or, in private, /disconnect GROUP_ID.")
+                return
+            if message["chat"]["type"] != "private" or target >= 0:
+                self.send(chat_id, "Manage another group's access from a private chat using its group ID.")
+                return
+            grant = self.store.get_access(target)
+            user_id = message["from"]["id"]
+            if not grant or grant["configured_by"] != user_id:
+                member = self.call("getChatMember", chat_id=target, user_id=user_id)
+                if member.get("status") not in ("administrator", "creator"):
+                    self.send(chat_id, "Only the credential owner or a group administrator can disconnect that group.")
+                    return
+        self.store.revoke_access(target)
+        self.customer_providers.pop(target, None)
+        self.send(chat_id, f"Access removed for chat <code>{target}</code>. Saved credentials and its watch were deleted.")
 
     def call(self, method, **payload):
         data = request_json(self.base + method, payload=payload, timeout=40)
@@ -313,7 +426,10 @@ class Bot:
             self.store.record_chat(chat)
             member = membership.get("new_chat_member", {})
             if member.get("status") in ("left", "kicked") or (member.get("status") == "restricted" and not member.get("is_member")):
-                self.store.delete(chat["id"])
+                self.store.revoke_access(chat["id"])
+                self.customer_providers.pop(chat["id"], None)
+            elif membership.get("old_chat_member", {}).get("status") in ("left", "kicked"):
+                self.send(chat["id"], self.activation_help(chat["id"]))
             return
         message = update.get("message") or update.get("edited_message")
         if not message:
@@ -329,6 +445,11 @@ class Bot:
         command, _, target = first.partition("@")
         if target and target.lower() != self.username.lower():
             return
+        parts = text.split(maxsplit=1)
+        args = parts[1].strip() if len(parts) == 2 else ""
+        if command == "/credentials":
+            self.handle_credentials(message, args)
+            return
         location = message.get("location")
         if command == "/watch":
             location = message.get("reply_to_message", {}).get("location")
@@ -336,18 +457,45 @@ class Bot:
             watch = self.store.get(chat_id)
             if not watch or watch.get("location_message_id") != message.get("message_id"):
                 return  # A stopped or replaced live location must not restart the watch.
-        if not private and (location or command in ("/watch", "/stop")):
+        if not private and (location or command in ("/watch", "/stop", "/promo", "/disconnect")):
             user_id = message.get("from", {}).get("id")
             # Anonymous administrators cannot be verified as an individual user.
             member = self.call("getChatMember", chat_id=chat_id, user_id=user_id) if user_id and not message.get("sender_chat") else {}
             if member.get("status") not in ("creator", "administrator"):
                 self.send(chat_id, "Only group administrators can set the watch location or stop alerts.")
                 return
+        if command == "/disconnect":
+            self.disconnect(message, args)
+            return
+        if command == "/promo":
+            if not self.activation_allowed(message.get("from", {}).get("id", chat_id)):
+                self.send(chat_id, "Too many activation attempts. Please wait one minute.")
+            elif self.provider is None:
+                self.send(chat_id, "The owner's API credentials are not configured. Connect your own credentials instead.")
+            elif not args or not self.store.redeem(args, chat_id, message.get("from", {}).get("id", chat_id)):
+                self.send(chat_id, "This promo code is invalid, expired, already redeemed here, revoked, or fully used.")
+            else:
+                self.customer_providers.pop(chat_id, None)
+                self.send(chat_id, "Promo code accepted. This chat can use the owner's flight data. Send a location to start alerts.", keyboard=private)
+            return
+        if command == "/access":
+            grant = self.store.get_access(chat_id)
+            if not grant:
+                self.send(chat_id, self.activation_help(chat_id))
+            elif grant["mode"] == "own":
+                self.send(chat_id, "This chat uses its own OpenSky credentials. Use /disconnect to delete them and stop alerts.")
+            else:
+                expiry = datetime.fromtimestamp(grant["expires_at"], timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+                self.send(chat_id, f"Promo access to the owner's flight data is active until {expiry}.")
+            return
         if command == "/stop":
             self.store.delete(chat_id)
             self.send(chat_id, "Alerts stopped and the saved watch location deleted. Share a location to start again.")
             return
         if command == "/status":
+            if not self.provider_for(chat_id):
+                self.send(chat_id, self.activation_help(chat_id))
+                return
             watch = self.store.get(chat_id)
             self.send(chat_id, (f"Watching within {watch['radius']:g} km. Checking every {self.interval:g} seconds. "
                                 "Use /stop to stop alerts and delete the saved location.") if watch else
@@ -358,6 +506,9 @@ class Bot:
                 return
             if not private and command not in ("/start", "/help", "/watch"):
                 return  # Don't answer ordinary group conversation or service messages.
+            if not self.store.get_access(chat_id):
+                self.send(chat_id, self.activation_help(chat_id))
+                return
             self.send(chat_id,
                       f"✈️ <b>Airways</b>\nShare your location to find airborne aircraft within {self.radius:g} km.\n\n"
                       "I'll save one watch location for this chat and send alerts when aircraft enter the area. "
@@ -367,6 +518,10 @@ class Bot:
                       "Live location edits move the watch; the last position remains active after sharing ends.\n"
                       "/status — check the watch\n/stop — stop alerts and delete the saved location\n\n"
                       "Search areas are sent to OpenSky; aircraft identifiers go to adsbdb for route/type lookup.", keyboard=private)
+            return
+        provider = self.provider_for(chat_id)
+        if provider is None:
+            self.send(chat_id, self.activation_help(chat_id))
             return
         lat, lon = location.get("latitude"), location.get("longitude")
         if not valid_location(lat, lon):
@@ -385,7 +540,7 @@ class Bot:
         watch["next_check"] = time.time() + self.interval
         try:
             self.store.metric("flight_lookups")
-            aircraft, timestamp = self.provider.nearby(lat, lon, self.radius)
+            aircraft, timestamp = provider.nearby(lat, lon, self.radius)
             if self.details:
                 self.details.enrich_all(aircraft[:8])
             report = format_report(aircraft, self.radius, timestamp)
@@ -417,9 +572,13 @@ class Bot:
         for watch in self.store.due(time.time()):
             chat_id = watch["chat_id"]
             watch["next_check"] = time.time() + self.interval
+            provider = self.provider_for(chat_id)
+            if provider is None:
+                self.store.save(watch)
+                continue  # Never fall back to owner or anonymous data for a locked chat.
             try:
                 self.store.metric("flight_lookups")
-                aircraft, timestamp = self.provider.nearby(watch["lat"], watch["lon"], watch["radius"])
+                aircraft, timestamp = provider.nearby(watch["lat"], watch["lon"], watch["radius"])
             except APIError as error:
                 self.store.metric("flight_errors")
                 LOG.warning("Watch lookup failed (status %s)", error.status)
@@ -465,7 +624,11 @@ class Bot:
                                            {"command": "help", "description": "How to share your location"},
                                            {"command": "watch", "description": "Watch a location (reply to a map pin)"},
                                            {"command": "status", "description": "Check active alerts"},
-                                           {"command": "stop", "description": "Stop alerts and delete saved location"}])
+                                           {"command": "stop", "description": "Stop alerts and delete saved location"},
+                                           {"command": "promo", "description": "Redeem a promo code for this chat"},
+                                           {"command": "credentials", "description": "Connect own API credentials in private"},
+                                           {"command": "access", "description": "Check flight-data access"},
+                                           {"command": "disconnect", "description": "Remove access and saved credentials"}])
         LOG.info("Airways is polling for location messages")
         offset, backoff = self.store.offset(), 1
         while True:
@@ -503,6 +666,13 @@ def main():
         raise SystemExit("Set TELEGRAM_BOT_TOKEN (see .env.example and README.md).")
     if bool(client_id) != bool(client_secret):
         raise SystemExit("Set both OPENSKY_CLIENT_ID and OPENSKY_CLIENT_SECRET, or neither.")
+    vault = None
+    encryption_key = os.environ.get("CREDENTIAL_ENCRYPTION_KEY", "").strip()
+    if encryption_key:
+        try:
+            vault = CredentialVault(encryption_key)
+        except (ValueError, TypeError):
+            raise SystemExit("CREDENTIAL_ENCRYPTION_KEY must be a valid Fernet key (see README.md).") from None
     try:
         radius = float(os.environ.get("SEARCH_RADIUS_KM", "50"))
         if not math.isfinite(radius) or not 1 <= radius <= 250:
@@ -521,7 +691,8 @@ def main():
         if os.environ.get("ADMIN_PASSWORD"):
             from admin import start_admin
             admin_server = start_admin(os.environ.get("STATE_DB_PATH", "data/airways.sqlite3"))
-        Bot(token, OpenSky(client_id, client_secret), radius, store, FlightDetails(), interval).run()
+        owner_provider = OpenSky(client_id, client_secret) if client_id else None
+        Bot(token, owner_provider, radius, store, FlightDetails(), interval, vault=vault).run()
     except KeyboardInterrupt:
         LOG.info("Airways stopped")
     except APIError as error:
