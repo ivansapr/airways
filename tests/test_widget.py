@@ -1,9 +1,12 @@
 import json
+import io
 import unittest
 import zlib
 from unittest.mock import Mock, patch
+from urllib.error import HTTPError
+from email.message import Message
 
-from bot import APIError, Aircraft, Bot
+from bot import APIError, Aircraft, Bot, request_json, telegram_error_reason
 from flight_widget import widget_html, widget_data, widget_caption
 
 
@@ -94,3 +97,25 @@ class WidgetTests(unittest.TestCase):
         with self.assertRaises(APIError):
             self.bot.send_aircraft(123, self.plane, 50, 1800000000)
         self.assertEqual(self.bot.call.call_count, 1)
+
+    def test_widget_error_reason_redacts_tokens_urls_and_chat_ids(self):
+        url = "https://api.telegram.org/bot123456:SECRET/sendWidget"
+        reason = telegram_error_reason("Bad Request: WIDGET_INVALID 123456:SECRET chat 987654321 https://example.com/key", url)
+        self.assertIn("WIDGET_INVALID", reason)
+        for secret in ("SECRET", "123456", "987654321", "https://example.com"):
+            self.assertNotIn(secret, reason)
+
+    @patch("bot.urlopen")
+    def test_http_widget_rejection_keeps_validation_reason(self, open_url):
+        url = "https://api.telegram.org/bot123456:SECRET/sendWidget"
+        def error():
+            return HTTPError(url, 400, "Bad Request", Message(),
+                             io.BytesIO(b'{"description":"Bad Request: INPUT_MEDIA_WIDGET_HTML_INVALID"}'))
+        open_url.side_effect = error()
+        with self.assertRaises(APIError) as caught:
+            request_json(url, payload={}, widget_errors=True)
+        self.assertIn("INPUT_MEDIA_WIDGET_HTML_INVALID", caught.exception.reason)
+        open_url.side_effect = error()
+        with self.assertRaises(APIError) as caught:
+            request_json(url, payload={})
+        self.assertEqual(caught.exception.reason, "")

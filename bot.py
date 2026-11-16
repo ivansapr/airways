@@ -5,6 +5,7 @@ import json
 import logging
 import math
 import os
+import re
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
@@ -26,13 +27,26 @@ KEYBOARD = {"keyboard": [[{"text": "📍 Share my location", "request_location":
 
 
 class APIError(Exception):
-    def __init__(self, status=0, retry_after=5):
+    def __init__(self, status=0, retry_after=5, reason=""):
         super().__init__(f"API request failed (status {status})")
         self.status = status
         self.retry_after = retry_after
+        self.reason = reason
 
 
-def request_json(url, *, payload=None, form=None, headers=None, timeout=20):
+def telegram_error_reason(description, url):
+    """Keep widget validation diagnostics while stripping URLs, tokens, and IDs."""
+    if not isinstance(description, str):
+        return ""
+    route = urlsplit(url).path.strip("/").split("/")[0]
+    if route.startswith("bot") and len(route) > 3:
+        description = description.replace(route[3:], "[redacted]")
+    description = re.sub(r"https?://\S+", "[url]", description)
+    description = re.sub(r"\d{6,}", "[id]", description)
+    return " ".join(description.split())[:240]
+
+
+def request_json(url, *, payload=None, form=None, headers=None, timeout=20, widget_errors=False):
     """Never include request URLs, credentials, or response bodies in errors."""
     headers = dict(headers or {})
     data = None
@@ -46,6 +60,7 @@ def request_json(url, *, payload=None, form=None, headers=None, timeout=20):
         with urlopen(Request(url, data=data, headers=headers), timeout=timeout) as response:
             return json.load(response)
     except HTTPError as error:
+        body = {}
         delay = error.headers.get("X-Rate-Limit-Retry-After-Seconds", error.headers.get("Retry-After", "5"))
         try:
             body = json.loads(error.read())
@@ -56,7 +71,8 @@ def request_json(url, *, payload=None, form=None, headers=None, timeout=20):
             delay = max(1, float(delay))
         except (TypeError, ValueError):
             delay = 5
-        raise APIError(error.code, delay) from None
+        reason = telegram_error_reason(body.get("description", ""), url) if widget_errors and isinstance(body, dict) else ""
+        raise APIError(error.code, delay, reason) from None
     except (URLError, TimeoutError, OSError, ValueError):
         raise APIError() from None
 
@@ -398,9 +414,10 @@ class Bot:
         self.send(chat_id, f"Access removed for chat <code>{target}</code>. Saved credentials and its watch were deleted.")
 
     def call(self, method, **payload):
-        data = request_json(self.base + method, payload=payload, timeout=40)
+        data = request_json(self.base + method, payload=payload, timeout=40, widget_errors=method == "sendWidget")
         if not data.get("ok"):
-            raise APIError(data.get("error_code", 0), data.get("parameters", {}).get("retry_after", 5))
+            reason = telegram_error_reason(data.get("description", ""), self.base + method) if method == "sendWidget" else ""
+            raise APIError(data.get("error_code", 0), data.get("parameters", {}).get("retry_after", 5), reason)
         return data["result"]
 
     def send(self, chat_id, text, keyboard=False):
@@ -419,7 +436,8 @@ class Bot:
                           chat_data=widget_data(plane, timestamp), caption=widget_caption(plane, timestamp),
                           allow_queries=False, protect_content=True)
             except APIError as error:
-                LOG.info("Message widget unavailable (status %s); flight card was delivered", error.status)
+                LOG.info("Message widget unavailable (status %s, reason: %s); flight card was delivered",
+                         error.status, error.reason or "not provided")
                 if error.status in (400, 404):
                     self.widget_unavailable_until = time.monotonic() + 3600
                 elif error.status == 429:
