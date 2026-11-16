@@ -11,5 +11,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
 ENV STATE_DB_PATH=/data/airways.sqlite3
 ENV ADMIN_HOST=0.0.0.0 ADMIN_PORT=8080
 EXPOSE 8080
+# Configure a named /data mount in Coolify or compose.yaml. VOLUME alone creates
+# an anonymous volume that a replacement container may not reuse.
 VOLUME ["/data"]
 CMD ["python", "bot.py"]

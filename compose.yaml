@@ -1,0 +1,27 @@
+services:
+  airways:
+    build: .
+    restart: unless-stopped
+    init: true
+    stop_grace_period: 30s
+    environment:
+      TELEGRAM_BOT_TOKEN: "${TELEGRAM_BOT_TOKEN:?Set TELEGRAM_BOT_TOKEN}"
+      OPENSKY_CLIENT_ID: "${OPENSKY_CLIENT_ID:-}"
+      OPENSKY_CLIENT_SECRET: "${OPENSKY_CLIENT_SECRET:-}"
+      CREDENTIAL_ENCRYPTION_KEY: "${CREDENTIAL_ENCRYPTION_KEY:-}"
+      ADMIN_PASSWORD: "${ADMIN_PASSWORD:-}"
+      ADMIN_HOST: "0.0.0.0"
+      ADMIN_PORT: "8080"
+      ADMIN_SECURE_COOKIE: "${ADMIN_SECURE_COOKIE:-1}"
+      SEARCH_RADIUS_KM: "${SEARCH_RADIUS_KM:-50}"
+      POLL_INTERVAL_SECONDS: "${POLL_INTERVAL_SECONDS:-60}"
+      TELEGRAM_WIDGETS: "${TELEGRAM_WIDGETS:-1}"
+      STATE_DB_PATH: "/data/airways.sqlite3"
+    expose:
+      - "8080"
+    volumes:
+      - airways-data:/data
+
+volumes:
+  airways-data:
+    name: "${AIRWAYS_DATA_VOLUME:-airways-data}"

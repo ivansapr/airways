@@ -128,6 +128,24 @@ The image binds the admin server to `0.0.0.0:8080` when a password is set. For l
 
 For Coolify, create an application from this repository using its Dockerfile, configure the environment variables, and mount persistent storage at `/data`. Route your HTTPS admin domain to port `8080`, and set `ADMIN_PASSWORD` to enable the web server. Disable HTTP health checks if running with the dashboard disabled. SQLite's data directory must be writable by container UID `65534`.
 
+### Keep data across redeployments
+
+For a Dockerfile application, open **Persistent Storage → Add Mount → Volume mount** in Coolify and configure:
+
+| Setting | Value |
+| --- | --- |
+| Name | `airways-data` |
+| Destination path | `/data` |
+| Environment variable | `STATE_DB_PATH=/data/airways.sqlite3` |
+
+Coolify adds the application's resource prefix to the volume name. Save the mount and redeploy. Keep this same volume attached on every deployment. Mount the whole directory, so SQLite's database, WAL, and shared-memory files are together. Keep `CREDENTIAL_ENCRYPTION_KEY` unchanged as well, otherwise saved customer credentials cannot be decrypted.
+
+The Dockerfile's `VOLUME /data` declaration alone does **not** configure a reusable named volume in Coolify. Without an explicit mount, a fresh anonymous volume can be attached to each replacement container, making existing data appear to disappear. See [Coolify's persistent storage documentation](https://coolify.io/docs/applications/configuration/persistent-storage).
+
+For a **new** Docker Compose deployment, [compose.yaml](compose.yaml) declares a named volume and fixes the database path at `/data/airways.sqlite3`. It exposes internal port `8080` for your Coolify domain; it does not publish a host port. If migrating an existing application to Compose, set `AIRWAYS_DATA_VOLUME` to the exact existing Docker volume name before deploying. Do not switch an existing application to an empty volume. Never run `docker compose down -v` for data you want to retain.
+
+If records disappear after a deployment, check retained Docker volumes **before deleting or pruning them**: the old database may still exist. Back up a candidate using SQLite's backup API so any committed WAL content is included, verify its integrity and record counts, then restore it into the named volume while no app is using that destination. A raw copy of an active `.sqlite3` file alone may omit recent changes. Retain the original volume and recovery backup until the restored app is verified. Persistent storage is local to the deployment server; use separate backups for server loss.
+
 Run one bot instance per Telegram token. Long polling requires outbound HTTPS, and any existing Telegram webhook must be removed before starting. The admin web server is optional; the bot itself does not need inbound ports. This repository does not create a Coolify deployment automatically.
 
 ## Data sources, quotas, and privacy
