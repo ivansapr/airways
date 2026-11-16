@@ -3,6 +3,7 @@
 !tracking.py
 !admin.py
 !access.py
+!flight_animation.py
 !flight_widget.py
 !widgets/
 !widgets/**
