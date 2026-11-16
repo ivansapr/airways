@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from threading import Lock
 from urllib.error import HTTPError, URLError
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlsplit
 from urllib.request import Request, urlopen
 
 from tracking import WatchStore
@@ -105,6 +105,7 @@ class Aircraft:
     age: int
     aircraft_type: str = "Unknown"
     route: str = "Unknown"
+    photo_url: str = ""
 
 
 def finite_number(value):
@@ -178,6 +179,27 @@ class OpenSky:
         return nearby_aircraft(states, lat, lon, radius, now), now
 
 
+def aircraft_name(aircraft):
+    manufacturer = str(aircraft.get("manufacturer") or "").strip()
+    for brand in ("Boeing", "Airbus", "Embraer", "Cessna", "Bombardier", "Dassault", "Beechcraft", "ATR"):
+        if brand.casefold() in manufacturer.casefold():
+            manufacturer = brand
+            break
+    model = str(aircraft.get("type") or "").strip()
+    if model:
+        if manufacturer and model.casefold().startswith(manufacturer.casefold()):
+            return (manufacturer + model[len(manufacturer):])[:80]
+        return " ".join(part for part in (manufacturer, model) if part)[:80]
+    code = str(aircraft.get("icao_type") or "").strip().upper()
+    names = {"B737": "Boeing 737-700", "B738": "Boeing 737-800", "B739": "Boeing 737-900",
+             "B38M": "Boeing 737 MAX 8", "B39M": "Boeing 737 MAX 9",
+             "B744": "Boeing 747-400", "B748": "Boeing 747-8", "B77W": "Boeing 777-300ER",
+             "B788": "Boeing 787-8", "B789": "Boeing 787-9", "A319": "Airbus A319",
+             "A320": "Airbus A320", "A321": "Airbus A321", "A20N": "Airbus A320neo",
+             "A21N": "Airbus A321neo", "A359": "Airbus A350-900", "A388": "Airbus A380-800"}
+    return names.get(code, " ".join(part for part in (manufacturer, code) if part) or "Unknown")[:80]
+
+
 class FlightDetails:
     """Best-effort adsbdb lookups; cache only in memory, never build a route database."""
 
@@ -191,7 +213,7 @@ class FlightDetails:
         with self.lock:
             cached = self.cache.get(key)
         if cached and cached[0] > now:
-            plane.aircraft_type, plane.route = cached[1:]
+            plane.aircraft_type, plane.route, plane.photo_url = cached[1:]
             return
         url = f"https://api.adsbdb.com/v0/aircraft/{plane.icao}?" + urlencode({"callsign": plane.callsign})
         ttl = 300
@@ -201,11 +223,16 @@ class FlightDetails:
                 data = {}
             aircraft = data.get("aircraft") or {}
             route = data.get("flightroute") or {}
-            plane.aircraft_type = str(aircraft.get("type") or aircraft.get("icao_type") or "Unknown")[:60]
+            plane.aircraft_type = aircraft_name(aircraft)
+            photo = aircraft.get("url_photo") or aircraft.get("url_photo_thumbnail") or ""
+            if isinstance(photo, str):
+                parsed = urlsplit(photo)
+                if parsed.scheme == "https" and parsed.hostname and not parsed.username and not parsed.password:
+                    plane.photo_url = photo
             airports = [route.get(part) or {} for part in ("origin", "midpoint", "destination")]
-            codes = [str(port.get("iata_code") or port.get("icao_code") or "")[:8] for port in airports]
-            if codes[0] and codes[-1]:
-                plane.route = " → ".join(code for code in codes if code)
+            cities = [str(port.get("municipality") or port.get("name") or "").strip()[:80] for port in airports]
+            if cities[0] or cities[-1]:
+                plane.route = " → ".join([cities[0] or "Unknown"] + ([cities[1]] if cities[1] else []) + [cities[-1] or "Unknown"])
             ttl = 3600
         except (APIError, AttributeError, TypeError, ValueError):
             pass  # Metadata must never prevent an alert with live position data.
@@ -214,7 +241,7 @@ class FlightDetails:
                 self.cache = {k: v for k, v in self.cache.items() if v[0] > now}
                 if len(self.cache) >= 2048:
                     self.cache.clear()
-            self.cache[key] = (now + ttl, plane.aircraft_type, plane.route)
+            self.cache[key] = (now + ttl, plane.aircraft_type, plane.route, plane.photo_url)
 
     def enrich_all(self, planes):
         with ThreadPoolExecutor(max_workers=4) as pool:
@@ -231,12 +258,10 @@ def format_report(aircraft, radius, timestamp, alert=False):
     for plane in aircraft[:8]:
         altitude = f"{plane.altitude:,.0f} m" if plane.altitude is not None else "unknown"
         speed = f"{plane.speed * 3.6:.0f} km/h" if plane.speed is not None else "unknown"
-        heading = f"{plane.heading:.0f}°" if plane.heading is not None else "unknown"
         lines.append(
             f'\n<b>{html.escape(plane.callsign[:32])}</b> · {plane.distance:.1f} km away\n'
-            f'Route: {html.escape(plane.route)}\nAircraft: {html.escape(plane.aircraft_type[:60])}\n'
-            f'Altitude {altitude} · Speed {speed}\nHeading {heading} · Position {plane.age}s ago\n'
-            f'ICAO {plane.icao} · Registered country: {html.escape(plane.country[:32])}\n'
+            f'Route: {html.escape(plane.route)}\nAircraft: {html.escape(plane.aircraft_type[:80])}\n'
+            f'Altitude {altitude} · Speed {speed}\n'
             f'<a href="https://www.google.com/maps/search/?api=1&amp;query={plane.lat:.5f},{plane.lon:.5f}">Map</a> · '
             f'<a href="https://globe.adsbexchange.com/?icao={plane.icao}">Aircraft tracker</a>')
     if len(aircraft) > 8:
@@ -268,6 +293,18 @@ class Bot:
         if keyboard:
             payload["reply_markup"] = KEYBOARD
         return self.call("sendMessage", **payload)
+
+    def send_aircraft(self, chat_id, plane, radius, timestamp, alert=False):
+        caption = format_report([plane], radius, timestamp, alert=alert)
+        if plane.photo_url:
+            try:
+                return self.call("sendPhoto", chat_id=chat_id, photo=plane.photo_url,
+                                 caption=caption, parse_mode="HTML")
+            except APIError as error:
+                if error.status != 400:
+                    raise  # Preserve rate limits and delivery retries.
+                LOG.info("Aircraft photo unavailable; sending text card")
+        return self.send(chat_id, caption)
 
     def handle(self, update):
         membership = update.get("my_chat_member")
@@ -363,9 +400,15 @@ class Bot:
             if error.status == 429:
                 watch["next_check"] = time.time() + max(self.interval, error.retry_after)
         self.store.save(watch)
-        self.send(chat_id, "<b>Nearby-flight alerts are active.</b> Use /stop to stop and delete the saved location.\n\n" + report)
-        watch["seen"].update({plane.icao: timestamp for plane in aircraft})
-        self.store.save(watch)
+        summary = (f"{len(aircraft)} aircraft within {self.radius:g} km. Showing the nearest {min(8, len(aircraft))}."
+                   if aircraft else report)
+        self.send(chat_id, "<b>Nearby-flight alerts are active.</b> Use /stop to stop and delete the saved location.\n\n" + summary)
+        for plane in aircraft[:8]:
+            if not self.store.get(chat_id):
+                break
+            self.send_aircraft(chat_id, plane, self.radius, timestamp)
+            watch["seen"][plane.icao] = timestamp
+            self.store.save(watch)
 
     def check_watches(self):
         """Run independently of incoming location messages; send each arrival once."""
@@ -390,26 +433,28 @@ class Bot:
             watch["seen"] = {icao: timestamp if icao in current else last
                              for icao, last in seen.items() if icao in current or timestamp - last < 600}
             arrivals = [plane for plane in aircraft if plane.icao not in seen][:8]
-            if arrivals:
-                if self.details:
-                    self.details.enrich_all(arrivals)
+            if self.details and arrivals:
+                self.details.enrich_all(arrivals)
+            for plane in arrivals:
                 try:
                     if not self.store.get(chat_id):
                         continue
-                    self.send(chat_id, format_report(arrivals, watch["radius"], timestamp, alert=True))
+                    self.send_aircraft(chat_id, plane, watch["radius"], timestamp, alert=True)
                 except APIError as error:
                     self.store.metric("delivery_errors")
                     if error.status == 403:
                         self.store.delete(chat_id)  # Blocked bot or removed from group.
-                        continue
+                        break
                     LOG.warning("Alert delivery failed (status %s)", error.status)
                     if error.status == 429:
                         self.telegram_blocked_until = time.time() + error.retry_after
                         self.store.save(watch)
                         return
+                    break  # Retry this and the remaining aircraft next check.
                 else:
-                    self.store.alert_sent(chat_id, len(arrivals))
-                    watch["seen"].update({plane.icao: timestamp for plane in arrivals})
+                    self.store.alert_sent(chat_id, 1)
+                    watch["seen"][plane.icao] = timestamp
+                    self.store.save(watch)
             self.store.save(watch)
 
     def run(self):

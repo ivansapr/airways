@@ -4,7 +4,7 @@ import tempfile
 from pathlib import Path
 from unittest.mock import Mock, patch
 
-from bot import APIError, Bot, FlightDetails, OpenSky, bounding_boxes, distance_km, format_report, nearby_aircraft
+from bot import APIError, Bot, FlightDetails, OpenSky, aircraft_name, bounding_boxes, distance_km, format_report, nearby_aircraft
 from tracking import WatchStore
 
 
@@ -76,7 +76,8 @@ class AircraftTests(unittest.TestCase):
         report = format_report(result, 50, NOW)
         self.assertIn("&lt;TAP&amp;123&gt;", report)
         self.assertIn("Altitude unknown", report)
-        self.assertIn("Position 5s ago", report)
+        for removed in ("Heading", "Position", "ICAO", "Registered country"):
+            self.assertNotIn(removed, report)
         self.assertIn("coverage may be incomplete", report)
 
     def test_report_limits_results_and_fits_telegram(self):
@@ -145,7 +146,35 @@ class BotTests(unittest.TestCase):
             self.bot.handle({"edited_message": self.message})
             self.bot.handle({"edited_message": self.message})
         self.assertEqual(self.provider.nearby.call_count, 2)
-        self.assertEqual(self.bot.call.call_count, 2)
+        self.assertEqual(self.bot.call.call_count, 4)  # Watch confirmation and aircraft card per location.
+
+    def test_aircraft_photo_has_readable_caption(self):
+        plane, = self.provider.nearby.return_value[0]
+        plane.aircraft_type = "Boeing 737-800"
+        plane.route = "Lisbon → London"
+        plane.photo_url = "https://photos.example.com/aircraft.jpg"
+        self.bot.send_aircraft(123, plane, 50, NOW, alert=True)
+        args = self.bot.call.call_args
+        self.assertEqual(args.args, ("sendPhoto",))
+        self.assertEqual(args.kwargs["photo"], plane.photo_url)
+        self.assertIn("Boeing 737-800", args.kwargs["caption"])
+        self.assertIn("Lisbon → London", args.kwargs["caption"])
+        self.assertLess(len(args.kwargs["caption"]), 1024)
+
+    def test_rejected_photo_falls_back_to_text(self):
+        plane, = self.provider.nearby.return_value[0]
+        plane.photo_url = "https://photos.example.com/missing.jpg"
+        self.bot.call.side_effect = [APIError(400), {}]
+        self.bot.send_aircraft(123, plane, 50, NOW)
+        self.assertEqual([call.args[0] for call in self.bot.call.call_args_list], ["sendPhoto", "sendMessage"])
+
+    def test_photo_rate_limit_is_not_bypassed_by_text(self):
+        plane, = self.provider.nearby.return_value[0]
+        plane.photo_url = "https://photos.example.com/aircraft.jpg"
+        self.bot.call.side_effect = APIError(429, 60)
+        with self.assertRaises(APIError):
+            self.bot.send_aircraft(123, plane, 50, NOW)
+        self.assertEqual(self.bot.call.call_count, 1)
 
     def test_provider_failure_is_not_reported_as_empty_sky(self):
         self.provider.nearby.side_effect = APIError(503)
@@ -251,6 +280,15 @@ class MonitoringTests(unittest.TestCase):
         self.assertEqual(self.bot.send.call_count, 2)
         self.assertIn("abc123", self.store.get(123)["seen"])
 
+    def test_partial_delivery_does_not_repeat_successful_aircraft(self):
+        self.bot.send.side_effect = [{}, APIError(500)]
+        self.tick([state(), state("abc124")], NOW)
+        self.assertEqual(set(self.store.get(123)["seen"]), {"abc123"})
+        self.bot.send.side_effect = None
+        self.tick([state(), state("abc124")], NOW + 60)
+        self.assertEqual(self.bot.send.call_count, 3)
+        self.assertEqual(set(self.store.get(123)["seen"]), {"abc123", "abc124"})
+
     def test_telegram_rate_limit_pauses_alerts_globally(self):
         self.bot.send.side_effect = APIError(429, 120)
         self.tick([state()], NOW)
@@ -289,17 +327,34 @@ class MonitoringTests(unittest.TestCase):
 class FlightDetailsTests(unittest.TestCase):
     @patch("bot.request_json")
     def test_type_and_route_with_midpoint_are_enriched_and_cached(self, request):
-        request.return_value = {"response": {"aircraft": {"type": "Airbus A320"},
-                                "flightroute": {"origin": {"iata_code": "LIS"},
-                                                "midpoint": {"iata_code": "MAD"},
-                                                "destination": {"icao_code": "EGLL"}}}}
+        request.return_value = {"response": {"aircraft": {"type": "737-800", "manufacturer": "BOEING",
+                                                         "url_photo": "https://photos.example.com/aircraft.jpg"},
+                                "flightroute": {"origin": {"municipality": "Lisbon", "iata_code": "LIS"},
+                                                "midpoint": {"municipality": "Madrid", "iata_code": "MAD"},
+                                                "destination": {"municipality": "London", "icao_code": "EGLL"}}}}
         details = FlightDetails()
         for _ in range(2):
             plane, = nearby_aircraft([state()], 38.73, -9.14, 50, NOW)
             details.enrich(plane)
-            self.assertEqual(plane.aircraft_type, "Airbus A320")
-            self.assertEqual(plane.route, "LIS → MAD → EGLL")
+            self.assertEqual(plane.aircraft_type, "Boeing 737-800")
+            self.assertEqual(plane.route, "Lisbon → Madrid → London")
+            self.assertEqual(plane.photo_url, "https://photos.example.com/aircraft.jpg")
         self.assertEqual(request.call_count, 1)
+
+    def test_aircraft_name_avoids_duplicate_manufacturer_and_expands_code(self):
+        self.assertEqual(aircraft_name({"manufacturer": "AIRBUS", "type": "Airbus A320"}), "Airbus A320")
+        self.assertEqual(aircraft_name({"icao_type": "B738"}), "Boeing 737-800")
+        self.assertEqual(aircraft_name({}), "Unknown")
+
+    @patch("bot.request_json")
+    def test_airport_name_fallback_and_missing_city(self, request):
+        request.return_value = {"response": {"aircraft": {"url_photo": None},
+                                "flightroute": {"origin": {"municipality": "", "name": "London Heathrow Airport"},
+                                                "destination": {"iata_code": "LIS"}}}}
+        plane, = nearby_aircraft([state()], 38.73, -9.14, 50, NOW)
+        FlightDetails().enrich(plane)
+        self.assertEqual(plane.route, "London Heathrow Airport → Unknown")
+        self.assertEqual(plane.photo_url, "")
 
     @patch("bot.request_json", side_effect=APIError(404))
     def test_missing_metadata_preserves_live_data(self, request):
