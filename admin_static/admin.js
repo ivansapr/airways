@@ -38,8 +38,13 @@ function renderChats() {
     identity.append(text); name.append(identity);
     const status = el('td');
     status.append(el('span', `badge${chat.watching ? '' : ' paused'}`, chat.watching ? '● Watching' : chat.watch_paused ? 'Watch paused' : 'Inactive'));
-    const accessLabel = {own: 'Own API credentials', promo: 'Owner API · promo', locked: 'Activation required'};
-    status.append(el('span', 'cell-sub', accessLabel[chat.access_mode] || 'Activation required'));
+    const accessLabel = {own: 'Bring Your Key · no app quota', promo: 'Promo · watch access', free: 'Free · current checks only'};
+    status.append(el('span', 'cell-sub', accessLabel[chat.access_mode] || 'Free · current checks only'));
+    if (chat.watching) {
+      const interval = Math.min(state.idle_poll_max || state.poll_interval || 60,
+        (state.poll_interval || 60) * 2 ** Math.min(chat.empty_checks || 0, 16));
+      status.append(el('span', 'cell-sub', `Checking every ${number(interval)}s`));
+    }
     if (chat.access_expires_at) status.append(el('span', 'cell-sub', `Until ${new Date(chat.access_expires_at * 1000).toLocaleDateString()}`));
     const location = el('td', '', chat.watching || chat.watch_paused ? `${chat.lat.toFixed(3)}, ${chat.lon.toFixed(3)}` : '—');
     if (chat.watching || chat.watch_paused) location.append(el('span', 'cell-sub', `${chat.radius} km radius`));
@@ -52,7 +57,7 @@ function renderChats() {
       button.addEventListener('click', () => stopWatch(chat));
       actions.append(button);
     }
-    if (chat.access_mode && chat.access_mode !== 'locked') {
+    if (['own', 'promo'].includes(chat.access_mode)) {
       const revoke = el('button', 'stop revoke-access', 'Revoke access');
       revoke.addEventListener('click', async () => {
         if (!confirm(`Remove API access, saved credentials, and the watch for ${chat.title}?`)) return;
@@ -110,6 +115,44 @@ function render() {
   $('week-updates').textContent = number(weeklyUpdates);
   renderChats();
   renderPromos();
+  renderAPIUsage();
+}
+function renderAPIUsage() {
+  const usage = state.api_usage || [];
+  const statuses = state.api_status || [];
+  const services = [
+    ['opensky', 'owner', 'OpenSky · owner', '4,000/day standard; 8,000/day active feeder; licensed plans differ'],
+    ['opensky', 'customer', 'OpenSky · customer accounts', 'Separate quota per account'],
+    ['opensky_auth', 'owner', 'OpenSky login · owner', 'Token service; separate from flight queries'],
+    ['opensky_auth', 'customer', 'OpenSky login · customers', 'Token service; separate from flight queries'],
+    ['adsbdb', 'shared', 'adsbdb · metadata', 'Quota unknown; observe 429 responses'],
+    ['telegram', 'shared', 'Telegram · bot', 'Delivery: ~30 messages/s across chats; per-chat limits apply']
+  ];
+  $('api-rows').replaceChildren();
+  for (const [provider, scope, label, limit] of services) {
+    const totals = usage.find(row => row.provider === provider && row.scope === scope) || {};
+    const status = statuses.find(row => row.provider === provider && row.scope === scope) || {};
+    const balance = el('td', '', limit);
+    if (provider === 'opensky' && scope === 'owner') {
+      const today = status.observed_at && new Date(status.observed_at * 1000).toISOString().slice(0, 10) === dateKey(0);
+      balance.append(el('span', 'cell-sub', status.remaining != null
+        ? `${number(status.remaining)} credits last reported · ${ago(status.observed_at)}${today ? '' : ' · stale'} `
+        : 'Remaining credits not reported yet'));
+      if (status.remaining != null && status.remaining <= 400 && today) balance.append(el('span', 'badge paused', 'Low reported balance'));
+    }
+    const wait = Math.ceil((status.retry_until || 0) - Date.now() / 1000);
+    const row = el('tr');
+    row.append(el('td', '', label), el('td', '', number(totals.requests)), el('td', '', number(totals.errors)),
+      el('td', '', number(totals.rate_limits)), balance, el('td', '', wait > 0 ? `${number(wait)}s remaining` : 'No observed backoff'));
+    $('api-rows').append(row);
+  }
+  const owner = state.chats.filter(chat => chat.watching && chat.access_mode === 'promo').length;
+  const customers = state.chats.filter(chat => chat.watching && chat.access_mode === 'own').length;
+  const base = state.poll_interval || 60;
+  const max = state.idle_poll_max || base;
+  const projected = mode => state.chats.filter(chat => chat.watching && chat.access_mode === mode)
+    .reduce((sum, chat) => sum + 86400 / Math.min(max, base * 2 ** Math.min(chat.empty_checks || 0, 16)), 0);
+  $('usage-forecast').textContent = `${owner} Promo and ${customers} Bring Your Key watches. At their current cadence: ~${number(Math.ceil(projected('promo')))} owner and ~${number(Math.ceil(projected('own')))} customer scheduled checks/day. Base interval ${base}s; empty-watch maximum ${max}s. Free snapshots, date-line splits and retries add requests; cache reuse may save requests. Large areas can cost multiple credits per query.`;
 }
 function renderPromos() {
   const promos = state.promos || [];
@@ -178,14 +221,24 @@ $('promo-form').addEventListener('submit', async event => {
   try {
     const result = await mutate('/api/promos', Object.fromEntries(new FormData(event.target)));
     $('promo-code').value = result.code; $('new-promo').hidden = false;
-    $('copy-promo').textContent = 'Copy'; await refresh();
+    $('copy-promo-status').textContent = 'Code created. Copy it before leaving this page.';
+    event.target.elements.code.value = '';
+    await refresh();
   } catch (error) { showError(error); }
   finally { button.disabled = false; }
 });
-$('copy-promo').addEventListener('click', async () => {
-  try { await navigator.clipboard.writeText($('promo-code').value); $('copy-promo').textContent = 'Copied'; }
-  catch { $('promo-code').select(); }
-});
+async function copyPromo(command = false) {
+  const value = `${command ? '/promo ' : ''}${$('promo-code').value}`;
+  try {
+    await navigator.clipboard.writeText(value);
+    $('copy-promo-status').textContent = command ? 'Promo command copied. Paste it into Telegram.' : 'Promo code copied.';
+  } catch {
+    $('promo-code').focus(); $('promo-code').select();
+    $('copy-promo-status').textContent = 'Clipboard unavailable. The code is selected; copy it manually and send /promo CODE.';
+  }
+}
+$('copy-promo').addEventListener('click', () => copyPromo());
+$('copy-promo-command').addEventListener('click', () => copyPromo(true));
 $('logout').addEventListener('click', async () => {
   if (!state) return;
   try { await mutate('/logout', {}); location.reload(); } catch (error) { showError(error); }

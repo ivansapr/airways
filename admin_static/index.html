@@ -12,6 +12,7 @@
     <p class="nav-label">WORKSPACE</p>
     <a class="nav-link selected" href="#overview"><span>◫</span> Overview <span class="nav-arrow">↗</span></a>
     <a class="nav-link" href="#chats"><span>◷</span> Chats & watches</a>
+    <a class="nav-link" href="#api-usage"><span>⌁</span> API usage & limits</a>
     <div class="sidebar-bottom"><div class="radar"><i></i><span>✈</span></div><h3>A little closer to the sky.</h3><p>Every passing flight.<br>One place to keep track.</p><div class="private-label">● PRIVATE CONTROL ROOM</div></div>
   </aside>
   <main class="content" id="overview">
@@ -29,12 +30,24 @@
       <article class="panel chart-panel"><div class="panel-heading"><div><p class="eyebrow">THE LAST 7 DAYS</p><h2>A week in the air</h2></div><span class="legend"><i></i> Alerts sent</span></div><div id="chart" class="chart" aria-label="Daily alerts for the last seven days"></div><p class="footnote">Daily totals in UTC · <span id="week-updates">—</span> updates received this week</p></article>
       <article class="panel health-panel"><p class="eyebrow">OPERATIONS</p><h2>Keeping things moving</h2><div class="health-row"><span>Last bot heartbeat</span><strong id="heartbeat">—</strong></div><div class="health-row"><span>Flight data errors today</span><strong id="flight-errors">—</strong></div><div class="health-row"><span>Delivery errors today</span><strong id="delivery-errors">—</strong></div><div class="health-note"><span>↗</span><p>Watches stay active until stopped. Route and aircraft details appear when the provider has a match.</p></div></article>
     </section>
+    <section class="panel api-panel" id="api-usage" aria-labelledby="api-heading">
+      <div class="panel-heading"><div><p class="eyebrow">THIRD-PARTY SERVICES</p><h2 id="api-heading">API usage & limits</h2></div><span class="muted">Today · UTC</span></div>
+      <p class="muted">Actual HTTP attempts, including retries and failed requests. Tracking starts after deployment; requests are not billing credits.</p>
+      <div class="table-wrap"><table><thead><tr><th>SERVICE / ACCOUNT</th><th>REQUESTS</th><th>ERRORS</th><th>429 RESPONSES</th><th>LIMIT / BALANCE</th><th>BACKOFF</th></tr></thead><tbody id="api-rows"></tbody></table></div>
+      <div class="usage-advice"><h3>Make your allowance go further</h3><p id="usage-forecast" class="muted"></p><ul>
+        <li>Increase POLL_INTERVAL_SECONDS from 60 to 120 to halve scheduled checks. Short flights may pass between checks.</li>
+        <li>Stop watches you no longer need. Promo invitations share your owner allowance; own-credential chats use their account.</li>
+        <li>Optional quiet-area mode: set IDLE_POLL_MAX_SECONDS=300 to slow empty watches up to five minutes. Seeing aircraft restores the base interval. Short visits can be missed.</li>
+        <li>Identical OpenSky searches on the same provider instance reuse results for ten seconds. Next: share regional searches between nearby watches on the same account. adsbdb metadata is already cached.</li>
+      </ul></div>
+      <p class="muted">OpenSky balance is the last owner response, not a live account total. Customer balances stay separate and are not aggregated. Backoff shows the latest observed 429 window; for customer accounts it may affect only some chats.</p>
+    </section>
     <section class="panel promo-panel"><div class="panel-heading"><div><p class="eyebrow">API ACCESS</p><h2>Promo codes</h2></div><span class="muted">Your credentials, by invitation</span></div>
-      <p class="muted">Every chat needs its own API credentials or a code. Create limited invitations to use your flight-data account.</p>
-      <form id="promo-form" class="promo-form"><label>Label<input name="label" placeholder="Friends & family" maxlength="80" required></label><label>Chat limit<input name="max_uses" type="number" min="1" max="10000" value="1" required></label><label>Redeem within (days)<input name="redeem_days" type="number" min="1" max="365" value="7" required></label><label>Access lasts (days)<input name="grant_days" type="number" min="1" max="365" value="30" required></label><button type="submit" class="secondary">Create code ↗</button></form>
-      <div id="new-promo" class="new-promo" hidden><label for="promo-code">Copy this code now. It is shown only once.</label><div><input id="promo-code" readonly aria-label="New promo code"><button type="button" id="copy-promo" class="secondary">Copy</button></div><p class="muted">Share it directly. The recipient sends /promo CODE in the chat being activated.</p></div>
+      <p class="muted">Free chats can check their current location using your account. Promo codes add arrival watches. Bring Your Key adds checks and watches without an app usage quota; provider limits still apply.</p>
+      <form id="promo-form" class="promo-form"><label>Label<input name="label" placeholder="Friends & family" maxlength="80" required></label><label>Custom code (optional)<input name="code" placeholder="FAMILY2026" minlength="6" maxlength="64" pattern="[A-Za-z0-9_-]{6,64}" title="6–64 letters, numbers, hyphens or underscores" autocomplete="off" spellcheck="false"><small>Leave blank to generate a code</small></label><label>Chat limit<input name="max_uses" type="number" min="1" max="10000" value="1" required></label><label>Redeem within (days)<input name="redeem_days" type="number" min="1" max="365" value="7" required></label><label>Access lasts (days)<input name="grant_days" type="number" min="1" max="365" value="30" required></label><button type="submit" class="secondary">Create code ↗</button></form>
+      <div id="new-promo" class="new-promo" hidden><label for="promo-code">Copy this code now. It is shown only once.</label><div><input id="promo-code" readonly aria-label="New promo code"><button type="button" id="copy-promo" class="secondary">Copy code</button><button type="button" id="copy-promo-command" class="secondary">Copy /promo command</button></div><p id="copy-promo-status" class="muted" role="status">Share it directly. The recipient sends /promo CODE in the chat being activated.</p></div>
       <div class="table-wrap"><table><thead><tr><th>INVITATION</th><th>CHATS USED</th><th>REDEEM BY</th><th>ACCESS DURATION</th><th>STATUS</th><th><span class="sr-only">Actions</span></th></tr></thead><tbody id="promo-rows"></tbody></table></div>
-      <p id="promos-empty" class="muted">No invitations yet. New chats cannot use your API allowance without a code.</p>
+      <p id="promos-empty" class="muted">No invitations yet. Free chats can make one-off checks; create a code to grant owner-funded watches.</p>
     </section>
     <section class="panel chats-panel" id="chats"><div class="panel-heading"><div><p class="eyebrow">YOUR AUDIENCE</p><h2>Chats & watches <span id="chat-count" class="count">0</span></h2></div><label class="search"><span>⌕</span><input id="search" type="search" placeholder="Search chats or IDs" aria-label="Search chats or IDs"></label></div>
       <div class="filters"><button class="filter active" data-filter="all">All chats</button><button class="filter" data-filter="watching">Watching</button><button class="filter" data-filter="group">Groups</button><button class="filter" data-filter="private">Private</button></div>

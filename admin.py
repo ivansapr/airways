@@ -117,6 +117,8 @@ class AdminHandler(BaseHTTPRequestHandler):
             finally:
                 store.db.close()
             data["csrf"] = token
+            data["poll_interval"] = float(os.environ.get("POLL_INTERVAL_SECONDS", "60"))
+            data["idle_poll_max"] = float(os.environ.get("IDLE_POLL_MAX_SECONDS") or str(data["poll_interval"]))
             self.respond(200, json.dumps(data), "application/json; charset=utf-8")
         else:
             self.respond(404, "Not found")
@@ -180,12 +182,16 @@ class AdminHandler(BaseHTTPRequestHandler):
                 result = {"ok": True}
                 if path == "/api/promos":
                     result = store.create_promo(data.get("label", ""), int(data.get("max_uses", 1)),
-                                                int(data.get("redeem_days", 7)), int(data.get("grant_days", 30)))
+                                                int(data.get("redeem_days", 7)), int(data.get("grant_days", 30)),
+                                                code=data.get("code", ""))
                 elif path == "/api/revoke-promo":
                     store.revoke_promo(int(data["id"]))
                 else:
                     store.revoke_access(int(data["chat_id"]))
-            except (ValueError, KeyError, TypeError):
+            except (ValueError, KeyError, TypeError) as error:
+                if path == "/api/promos" and str(error).startswith(("Custom code", "This promo code")):
+                    self.respond(400, str(error))
+                    return
                 self.respond(400, "Invalid fields. Uses: 1–10000; days: 1–365.")
                 return
             finally:

@@ -3,6 +3,7 @@
 import json
 import hashlib
 import secrets
+import re
 import sqlite3
 import time
 from datetime import datetime, timezone
@@ -22,12 +23,21 @@ class WatchStore:
         columns = {row[1] for row in self.db.execute("PRAGMA table_info(watches)")}
         if "location_message_id" not in columns:
             self.db.execute("ALTER TABLE watches ADD COLUMN location_message_id INTEGER")
+        if "empty_checks" not in columns:
+            self.db.execute("ALTER TABLE watches ADD COLUMN empty_checks INTEGER NOT NULL DEFAULT 0")
         self.db.execute("CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value INTEGER)")
         self.db.execute("""CREATE TABLE IF NOT EXISTS chats (
             chat_id INTEGER PRIMARY KEY, title TEXT, kind TEXT,
             first_seen REAL, last_seen REAL, updates INTEGER DEFAULT 0, alerts INTEGER DEFAULT 0)""")
         self.db.execute("""CREATE TABLE IF NOT EXISTS metrics (
             day TEXT, name TEXT, value INTEGER DEFAULT 0, PRIMARY KEY (day, name))""")
+        self.db.execute("""CREATE TABLE IF NOT EXISTS api_usage (
+            day TEXT, provider TEXT, scope TEXT, requests INTEGER DEFAULT 0,
+            errors INTEGER DEFAULT 0, rate_limits INTEGER DEFAULT 0,
+            PRIMARY KEY(day, provider, scope))""")
+        self.db.execute("""CREATE TABLE IF NOT EXISTS api_status (
+            provider TEXT, scope TEXT, remaining INTEGER, observed_at REAL,
+            retry_until REAL, PRIMARY KEY(provider, scope))""")
         self.db.execute("""CREATE TABLE IF NOT EXISTS promos (
             id INTEGER PRIMARY KEY, code_hash TEXT UNIQUE, label TEXT, max_uses INTEGER,
             redeem_until REAL, grant_days INTEGER, enabled INTEGER DEFAULT 1, created_at REAL)""")
@@ -58,8 +68,8 @@ class WatchStore:
     def save(self, watch):
         with self.db:
             # UPDATE cannot resurrect a watch stopped concurrently from the admin page.
-            self.db.execute("""UPDATE watches SET seen=?, next_check=? WHERE chat_id=?""",
-                            (json.dumps(watch["seen"]), watch["next_check"], watch["chat_id"]))
+            self.db.execute("""UPDATE watches SET seen=?, next_check=?, empty_checks=? WHERE chat_id=?""",
+                            (json.dumps(watch["seen"]), watch["next_check"], watch.get("empty_checks", 0), watch["chat_id"]))
 
     def delete(self, chat_id):
         with self.db:
@@ -101,21 +111,25 @@ class WatchStore:
         self.metric("aircraft_alerted", aircraft_count)
 
     def dashboard(self):
-        chats = [dict(row) for row in self.db.execute("""SELECT c.*, w.radius, w.lat, w.lon, w.next_check,
+        chats = [dict(row) for row in self.db.execute("""SELECT c.*, w.radius, w.lat, w.lon, w.next_check, w.empty_checks,
             CASE WHEN w.chat_id IS NULL THEN 0 ELSE 1 END AS watching
             FROM chats c LEFT JOIN watches w ON c.chat_id=w.chat_id ORDER BY c.last_seen DESC""")]
         metrics = [dict(row) for row in self.db.execute("SELECT * FROM metrics ORDER BY day")]
         heartbeat = self.db.execute("SELECT value FROM settings WHERE key='heartbeat'").fetchone()
         for chat in chats:
             grant = self.get_access(chat["chat_id"])
-            chat["access_mode"] = grant["mode"] if grant else "locked"
+            chat["access_mode"] = grant["mode"] if grant else "free"
             chat["access_expires_at"] = grant["expires_at"] if grant else None
             chat["watch_paused"] = bool(chat["watching"] and not grant)
             chat["watching"] = int(bool(chat["watching"] and grant))
         promos = [dict(row) for row in self.db.execute("""SELECT p.id, p.label, p.max_uses,
             p.redeem_until, p.grant_days, p.enabled, COUNT(r.chat_id) AS uses
             FROM promos p LEFT JOIN redemptions r ON r.promo_id=p.id GROUP BY p.id ORDER BY p.id DESC""")]
-        return dict(chats=chats, metrics=metrics, promos=promos, heartbeat=heartbeat[0] if heartbeat else None,
+        today = datetime.now(timezone.utc).date().isoformat()
+        usage = [dict(row) for row in self.db.execute("SELECT * FROM api_usage WHERE day=?", (today,))]
+        status = [dict(row) for row in self.db.execute("SELECT * FROM api_status")]
+        return dict(chats=chats, metrics=metrics, promos=promos, api_usage=usage, api_status=status,
+                    heartbeat=heartbeat[0] if heartbeat else None,
                     active_watches=sum(chat["watching"] for chat in chats),
                     generated_at=time.time())
 
@@ -123,15 +137,23 @@ class WatchStore:
         with self.db:
             self.db.execute("INSERT OR REPLACE INTO settings VALUES ('heartbeat', ?)", (int(time.time()),))
 
-    def create_promo(self, label, max_uses=1, redeem_days=7, grant_days=30):
+    def create_promo(self, label, max_uses=1, redeem_days=7, grant_days=30, code=""):
         if not (1 <= max_uses <= 10000 and 1 <= redeem_days <= 365 and 1 <= grant_days <= 365):
             raise ValueError("Use limits must be 1–10000; expiry and access days must be 1–365.")
-        code = "AIR-" + secrets.token_hex(12).upper()
+        if not isinstance(code, str):
+            raise ValueError("Custom code must be text.")
+        code = code.strip().upper()
+        if code and not re.fullmatch(r"[A-Z0-9_-]{6,64}", code):
+            raise ValueError("Custom code must be 6–64 letters, numbers, hyphens or underscores.")
+        code = code or "AIR-" + secrets.token_hex(12).upper()
         digest = hashlib.sha256(code.encode()).hexdigest()
-        with self.db:
-            cursor = self.db.execute("""INSERT INTO promos
-                (code_hash, label, max_uses, redeem_until, grant_days, created_at) VALUES (?, ?, ?, ?, ?, ?)""",
-                (digest, str(label).strip()[:80] or "Promo", max_uses, time.time() + redeem_days * 86400, grant_days, time.time()))
+        try:
+            with self.db:
+                cursor = self.db.execute("""INSERT INTO promos
+                    (code_hash, label, max_uses, redeem_until, grant_days, created_at) VALUES (?, ?, ?, ?, ?, ?)""",
+                    (digest, str(label).strip()[:80] or "Promo", max_uses, time.time() + redeem_days * 86400, grant_days, time.time()))
+        except sqlite3.IntegrityError:
+            raise ValueError("This promo code already exists. Choose a different code.") from None
         return dict(id=cursor.lastrowid, code=code)
 
     def redeem(self, code, chat_id, user_id):
@@ -177,3 +199,39 @@ class WatchStore:
     def revoke_promo(self, promo_id):
         with self.db:
             self.db.execute("UPDATE promos SET enabled=0 WHERE id=?", (promo_id,))
+
+
+class APIUsage:
+    """Persist only allowlisted service names and counters, using a connection per worker."""
+
+    def __init__(self, path):
+        self.path = path
+
+    def record(self, provider, scope, status, remaining=None, retry_after=0):
+        now = time.time()
+        day = datetime.fromtimestamp(now, timezone.utc).date().isoformat()
+        try:
+            remaining = int(remaining) if remaining is not None else None
+            if remaining is not None and remaining < 0:
+                remaining = None
+        except (ValueError, TypeError, OverflowError):
+            remaining = None
+        # Customer quotas belong to separate accounts; never combine their balances.
+        if scope != "owner":
+            remaining = None
+        retry_until = now + retry_after if status == 429 else 0
+        db = sqlite3.connect(self.path, timeout=2)
+        try:
+            with db:
+                db.execute("""INSERT INTO api_usage VALUES (?, ?, ?, 1, ?, ?)
+                    ON CONFLICT(day, provider, scope) DO UPDATE SET requests=requests+1,
+                    errors=errors+excluded.errors, rate_limits=rate_limits+excluded.rate_limits""",
+                    (day, provider, scope, int(status == 0 or status >= 400), int(status == 429)))
+                db.execute("""INSERT INTO api_status VALUES (?, ?, ?, ?, ?)
+                    ON CONFLICT(provider, scope) DO UPDATE SET
+                    remaining=CASE WHEN excluded.remaining IS NOT NULL THEN excluded.remaining ELSE remaining END,
+                    observed_at=CASE WHEN excluded.remaining IS NOT NULL THEN excluded.observed_at ELSE observed_at END,
+                    retry_until=MAX(retry_until, excluded.retry_until)""",
+                    (provider, scope, remaining, now if remaining is not None else None, retry_until))
+        finally:
+            db.close()

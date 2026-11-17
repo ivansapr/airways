@@ -129,6 +129,28 @@ class AdminTests(unittest.TestCase):
         for body in ('{"max_uses":0}', '{"grant_days":0}', '{"redeem_days":999}', '[]'):
             self.assertEqual(self.request("POST", "/api/promos", body, headers)[0], 400)
 
+    def test_custom_promo_can_be_created_and_duplicates_have_useful_error(self):
+        headers, token = self.login()
+        headers['X-CSRF-Token'] = token
+        body = json.dumps({'label': 'Family', 'code': 'family2026'})
+        status, _, result = self.request('POST', '/api/promos', body, headers)
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(result)['code'], 'FAMILY2026')
+        status, _, error = self.request('POST', '/api/promos', body, headers)
+        self.assertEqual(status, 400)
+        self.assertIn(b'already exists', error)
+        _, _, overview = self.request('GET', '/api/overview', headers=headers)
+        self.assertNotIn(b'FAMILY2026', overview)
+
+    def test_invalid_custom_code_is_rejected_by_server(self):
+        headers, token = self.login()
+        headers['X-CSRF-Token'] = token
+        for code in ('bad', 'with space', ['FAMILY2026'], 123456):
+            with self.subTest(code=code):
+                status, _, error = self.request('POST', '/api/promos', json.dumps({'code': code}), headers)
+                self.assertEqual(status, 400)
+                self.assertIn(b'Custom code', error)
+
     def test_admin_can_revoke_customer_credentials_without_reading_them(self):
         store = WatchStore(self.path)
         self.addCleanup(store.db.close)

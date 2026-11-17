@@ -16,12 +16,14 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode, urlsplit
 from urllib.request import Request, urlopen
 
-from tracking import WatchStore
+from tracking import APIUsage, WatchStore
 from access import CredentialVault
 
 LOG = logging.getLogger("airways")
+API_USAGE = None
 EARTH_KM = 6371.0088
 TOKEN_URL = "https://auth.opensky-network.org/auth/realms/opensky-network/protocol/openid-connect/token"
+OPENSKY_ACCOUNT_URL = "https://opensky-network.org/my-opensky/account"
 KEYBOARD = {"keyboard": [[{"text": "📍 Share my location", "request_location": True}]],
             "resize_keyboard": True}
 
@@ -46,7 +48,8 @@ def telegram_error_reason(description, url):
     return " ".join(description.split())[:240]
 
 
-def request_json(url, *, payload=None, form=None, headers=None, timeout=20, widget_errors=False, files=None):
+def request_json(url, *, payload=None, form=None, headers=None, timeout=20, widget_errors=False, files=None,
+                 usage_scope="shared"):
     """Never include request URLs, credentials, or response bodies in errors."""
     headers = dict(headers or {})
     data = None
@@ -66,10 +69,19 @@ def request_json(url, *, payload=None, form=None, headers=None, timeout=20, widg
     elif form is not None:
         data = urlencode(form).encode()
         headers["Content-Type"] = "application/x-www-form-urlencoded"
+    status, remaining, retry_after = 0, None, 0
     try:
         with urlopen(Request(url, data=data, headers=headers), timeout=timeout) as response:
-            return json.load(response)
+            remaining = response.headers.get("X-Rate-Limit-Remaining")
+            result = json.load(response)
+            status = response.status
+            if urlsplit(url).hostname == "api.telegram.org" and isinstance(result, dict) and result.get("ok") is False:
+                status = result.get("error_code", 500)
+                retry_after = result.get("parameters", {}).get("retry_after", 5)
+            return result
     except HTTPError as error:
+        status = error.code
+        remaining = error.headers.get("X-Rate-Limit-Remaining")
         body = {}
         delay = error.headers.get("X-Rate-Limit-Retry-After-Seconds", error.headers.get("Retry-After", "5"))
         try:
@@ -81,10 +93,21 @@ def request_json(url, *, payload=None, form=None, headers=None, timeout=20, widg
             delay = max(1, float(delay))
         except (TypeError, ValueError):
             delay = 5
+        if not math.isfinite(delay):
+            delay = 5
+        retry_after = delay
         reason = telegram_error_reason(body.get("description", ""), url) if widget_errors and isinstance(body, dict) else ""
         raise APIError(error.code, delay, reason) from None
     except (URLError, TimeoutError, OSError, ValueError):
         raise APIError() from None
+    finally:
+        provider = {"opensky-network.org": "opensky", "auth.opensky-network.org": "opensky_auth",
+                    "api.adsbdb.com": "adsbdb", "api.telegram.org": "telegram"}.get(urlsplit(url).hostname)
+        if API_USAGE is not None and provider:
+            try:
+                API_USAGE.record(provider, usage_scope, status, remaining, retry_after)
+            except Exception:
+                LOG.warning("Could not persist API usage")
 
 
 def valid_location(lat, lon):
@@ -168,16 +191,19 @@ def nearby_aircraft(states, lat, lon, radius, now):
 
 
 class OpenSky:
-    def __init__(self, client_id="", client_secret=""):
+    def __init__(self, client_id="", client_secret="", usage_scope="owner"):
         self.client_id, self.client_secret = client_id, client_secret
+        self.usage_scope = usage_scope
         self.token, self.expires_at, self.blocked_until = "", 0, 0
+        self.search_cache = {}
 
     def headers(self):
         if not self.client_id:
             return {}
         if time.monotonic() >= self.expires_at:
             response = request_json(TOKEN_URL, form={"grant_type": "client_credentials",
-                                    "client_id": self.client_id, "client_secret": self.client_secret})
+                                    "client_id": self.client_id, "client_secret": self.client_secret},
+                                    usage_scope=self.usage_scope)
             if not response.get("access_token"):
                 raise APIError(401)
             self.token = response["access_token"]
@@ -187,23 +213,32 @@ class OpenSky:
     def nearby(self, lat, lon, radius):
         if time.monotonic() < self.blocked_until:
             raise APIError(429, self.blocked_until - time.monotonic())
+        key = (lat, lon, radius)
+        cached = self.search_cache.get(key)
+        if cached and time.monotonic() < cached[0]:
+            # Return fresh objects: metadata enrichment mutates Aircraft instances.
+            return nearby_aircraft(cached[1], lat, lon, radius, cached[2]), cached[2]
         states = []
         try:
             for box in bounding_boxes(lat, lon, radius):
                 url = "https://opensky-network.org/api/states/all?" + urlencode(box)
                 try:
-                    data = request_json(url, headers=self.headers())
+                    data = request_json(url, headers=self.headers(), usage_scope=self.usage_scope)
                 except APIError as error:
                     if error.status != 401 or not self.client_id:
                         raise
                     self.expires_at = 0
-                    data = request_json(url, headers=self.headers())
+                    data = request_json(url, headers=self.headers(), usage_scope=self.usage_scope)
                 states.extend(data.get("states") or [])
         except APIError as error:
             if error.status == 429:
                 self.blocked_until = time.monotonic() + error.retry_after
             raise
         now = time.time()
+        self.search_cache = {k: value for k, value in self.search_cache.items() if value[0] > time.monotonic()}
+        if len(self.search_cache) >= 1024:
+            self.search_cache.clear()
+        self.search_cache[key] = (time.monotonic() + 10, states, now)
         return nearby_aircraft(states, lat, lon, radius, now), now
 
 
@@ -308,24 +343,26 @@ def format_report(aircraft, radius, timestamp, alert=False):
 
 
 class Bot:
-    def __init__(self, token, provider, radius=50, store=None, details=None, interval=60, vault=None):
+    def __init__(self, token, provider, radius=50, store=None, details=None, interval=60, vault=None,
+                 idle_max=None):
         self.base = f"https://api.telegram.org/bot{token}/"
         self.provider, self.radius = provider, radius
         self.cooldowns = {}
         self.store = store if store is not None else WatchStore()
         self.details = details
         self.interval = interval
+        self.idle_max = max(interval, idle_max if idle_max is not None else interval)
         self.username = ""
         self.telegram_blocked_until = 0
         self.vault = vault
         self.customer_providers = {}
         self.activation_attempts = {}
 
-    def provider_for(self, chat_id):
+    def provider_for(self, chat_id, snapshot=False):
         grant = self.store.get_access(chat_id)
         if not grant:
             self.customer_providers.pop(chat_id, None)
-            return None
+            return self.provider if snapshot else None
         if grant["mode"] == "promo":
             self.customer_providers.pop(chat_id, None)
             return self.provider
@@ -338,18 +375,28 @@ class Bot:
             client_id, secret = self.vault.open(grant["credentials"])
         except ValueError:
             return None
-        provider = OpenSky(client_id, secret)
+        provider = OpenSky(client_id, secret, usage_scope="customer")
         if len(self.customer_providers) >= 1024:
             self.customer_providers.clear()
         self.customer_providers[chat_id] = (grant["credentials"], provider)
         return provider
 
     def activation_help(self, chat_id):
-        target = f"{chat_id} " if chat_id < 0 else ""
-        return ("<b>Activate flight data first</b>\n"
+        return ("<b>Free · current location checks</b>\n"
+                "Send a location for a one-off check. Free checks use the owner's flight-data allowance; no watch is started.\n\n"
+                "<b>Promo · checks + arrival watches</b>\n"
                 "Redeem a code from the bot owner here: <code>/promo YOUR_CODE</code>\n\n"
-                "Or send your own OpenSky API client credentials to me in a <b>private chat</b>:\n"
+                + self.key_setup_help(chat_id))
+
+    def key_setup_help(self, chat_id):
+        target = f"{chat_id} " if chat_id < 0 else ""
+        return ("<b>Bring Your Key · checks + watches, no app usage quota</b>\n"
+                f'1. <a href="{OPENSKY_ACCOUNT_URL}">Register or sign in at OpenSky</a>.\n'
+                "2. In your OpenSky account, create an API client and copy its client ID and client secret.\n"
+                '3. <a href="https://openskynetwork.github.io/opensky-api/rest.html#authentication">Read the API setup guide</a>, '
+                "then send the credentials to me in a <b>private chat</b>:\n"
                 f"<code>/credentials {target}CLIENT_ID CLIENT_SECRET</code>\n"
+                "Your provider's quotas and rate limits still apply.\n"
                 "Group activation requires a group administrator. Never post API secrets in a group.\n"
                 "Use /access to check access or /disconnect to remove it.")
 
@@ -396,7 +443,7 @@ class Bot:
             self.send(chat_id, "Too many activation attempts. Please wait one minute.")
             return
         client_id, secret = parts
-        provider = OpenSky(client_id, secret)
+        provider = OpenSky(client_id, secret, usage_scope="customer")
         try:
             provider.headers()  # Validate OAuth without using the owner's data allowance.
         except APIError:
@@ -493,7 +540,13 @@ class Bot:
             return
         parts = text.split(maxsplit=1)
         args = parts[1].strip() if len(parts) == 2 else ""
+        if command == "/register":
+            self.send(chat_id, self.key_setup_help(chat_id), keyboard=private)
+            return
         if command == "/credentials":
+            if not args:
+                self.send(chat_id, self.activation_help(chat_id), keyboard=private)
+                return
             self.handle_credentials(message, args)
             return
         location = message.get("location")
@@ -501,7 +554,8 @@ class Bot:
             location = message.get("reply_to_message", {}).get("location")
         if "edited_message" in update:
             watch = self.store.get(chat_id)
-            if not watch or watch.get("location_message_id") != message.get("message_id"):
+            if (not self.store.get_access(chat_id) or not watch
+                    or watch.get("location_message_id") != message.get("message_id")):
                 return  # A stopped or replaced live location must not restart the watch.
         if not private and (location or command in ("/watch", "/stop", "/promo", "/disconnect")):
             user_id = message.get("from", {}).get("id")
@@ -527,23 +581,23 @@ class Bot:
         if command == "/access":
             grant = self.store.get_access(chat_id)
             if not grant:
-                self.send(chat_id, self.activation_help(chat_id))
+                self.send(chat_id, self.activation_help(chat_id), keyboard=private)
             elif grant["mode"] == "own":
-                self.send(chat_id, "This chat uses its own OpenSky credentials. Use /disconnect to delete them and stop alerts.")
+                self.send(chat_id, "Bring Your Key: current checks and watches with no app usage quota. OpenSky quotas and rate limits still apply. Use /disconnect to delete credentials and stop alerts.")
             else:
                 expiry = datetime.fromtimestamp(grant["expires_at"], timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-                self.send(chat_id, f"Promo access to the owner's flight data is active until {expiry}.")
+                self.send(chat_id, f"Promo: current checks and arrival watches using the owner's flight data, active until {expiry}.")
             return
         if command == "/stop":
             self.store.delete(chat_id)
-            self.send(chat_id, "Alerts stopped and the saved watch location deleted. Share a location to start again.")
+            self.send(chat_id, "Alerts stopped and the saved watch location deleted. Share a location for a new check.")
             return
         if command == "/status":
             if not self.provider_for(chat_id):
                 self.send(chat_id, self.activation_help(chat_id))
                 return
             watch = self.store.get(chat_id)
-            self.send(chat_id, (f"Watching within {watch['radius']:g} km. Checking every {self.interval:g} seconds. "
+            self.send(chat_id, (f"Watching within {watch['radius']:g} km. Current check interval: {self.watch_interval(watch):g} seconds. "
                                 "Use /stop to stop alerts and delete the saved location.") if watch else
                       "No active watch. Share a location to start alerts.")
             return
@@ -553,21 +607,25 @@ class Bot:
             if not private and command not in ("/start", "/help", "/watch"):
                 return  # Don't answer ordinary group conversation or service messages.
             if not self.store.get_access(chat_id):
-                self.send(chat_id, self.activation_help(chat_id))
+                self.send(chat_id, self.activation_help(chat_id), keyboard=private)
                 return
             self.send(chat_id,
                       f"✈️ <b>Airways</b>\nShare your location to find airborne aircraft within {self.radius:g} km.\n\n"
                       "I'll save one watch location for this chat and send alerts when aircraft enter the area. "
-                      f"Checks run every {self.interval:g} seconds.\n\n"
+                      f"Checks run every {self.interval:g} seconds, slowing to at most {self.idle_max:g} seconds when empty.\n\n"
                       "Use 📎 → Location. In groups, an administrator can reply to a location with /watch@"
                       f"{self.username or 'your_bot'}. Only group admins can change or stop the watch.\n\n"
                       "Live location edits move the watch; the last position remains active after sharing ends.\n"
                       "/status — check the watch\n/stop — stop alerts and delete the saved location\n\n"
                       "Search areas are sent to OpenSky; aircraft identifiers go to adsbdb for route/type lookup.", keyboard=private)
             return
-        provider = self.provider_for(chat_id)
+        can_watch = self.store.get_access(chat_id) is not None
+        if command == "/watch" and not can_watch:
+            self.send(chat_id, "Arrival watches require a promo code or your own API key.\n\n" + self.activation_help(chat_id))
+            return
+        provider = self.provider_for(chat_id, snapshot=True)
         if provider is None:
-            self.send(chat_id, self.activation_help(chat_id))
+            self.send(chat_id, "Flight data is unavailable for this chat. The owner must configure OpenSky for Free checks, or you can connect your own key.\n\n" + self.activation_help(chat_id))
             return
         lat, lon = location.get("latitude"), location.get("longitude")
         if not valid_location(lat, lon):
@@ -580,6 +638,9 @@ class Bot:
                 self.send(chat_id, "Please wait 15 seconds between flight searches.")
             return
         self.cooldowns[chat_id] = now + 15
+        if not can_watch:
+            self.snapshot(chat_id, provider, lat, lon)
+            return
         source = message.get("reply_to_message", {}) if command == "/watch" else message
         self.store.set_location(chat_id, lat, lon, self.radius, source.get("message_id"))
         watch = self.store.get(chat_id)
@@ -600,6 +661,8 @@ class Bot:
             aircraft, timestamp = [], time.time()
             if error.status == 429:
                 watch["next_check"] = time.time() + max(self.interval, error.retry_after)
+        else:
+            self.schedule_watch(watch, aircraft)
         self.store.save(watch)
         summary = (f"{len(aircraft)} aircraft within {self.radius:g} km. Showing the nearest {min(8, len(aircraft))}."
                    if aircraft else report)
@@ -612,6 +675,35 @@ class Bot:
             self.send_aircraft(chat_id, plane, self.radius, timestamp)
             watch["seen"][plane.icao] = timestamp
             self.store.save(watch)
+
+    def snapshot(self, chat_id, provider, lat, lon):
+        """A Free check never writes a location, arrival history, or polling schedule."""
+        try:
+            self.store.metric("flight_lookups")
+            aircraft, timestamp = provider.nearby(lat, lon, self.radius)
+            if self.details:
+                self.details.enrich_all(aircraft[:8])
+        except APIError as error:
+            self.store.metric("flight_errors")
+            text = (f"Flight data is rate limited. Try again in {math.ceil(error.retry_after)} seconds."
+                    if error.status == 429 else "Flight data is temporarily unavailable. Send your location again to retry.")
+            self.send(chat_id, text)
+            return
+        summary = (f"{len(aircraft)} aircraft within {self.radius:g} km. Showing the nearest {min(8, len(aircraft))}."
+                   if aircraft else format_report(aircraft, self.radius, timestamp))
+        self.send(chat_id, "<b>Current location check · Free</b>\n" + summary +
+                  "\n\nNo watch started. Use /access to see tiers and enable arrival alerts.")
+        for plane in aircraft[:8]:
+            if time.time() < self.telegram_blocked_until:
+                break
+            self.send_aircraft(chat_id, plane, self.radius, timestamp)
+
+    def watch_interval(self, watch):
+        return min(self.idle_max, self.interval * 2 ** min(watch.get("empty_checks", 0), 16))
+
+    def schedule_watch(self, watch, aircraft):
+        watch["empty_checks"] = 0 if aircraft else min(watch.get("empty_checks", 0) + 1, 16)
+        watch["next_check"] = time.time() + self.watch_interval(watch)
 
     def check_watches(self):
         """Run independently of incoming location messages; send each arrival once."""
@@ -635,6 +727,7 @@ class Bot:
                 watch["next_check"] = time.time() + max(self.interval, error.retry_after)
                 self.store.save(watch)
                 continue  # An outage is not evidence that an aircraft left the area.
+            self.schedule_watch(watch, aircraft)
             current = {plane.icao for plane in aircraft}
             seen = watch["seen"]
             # Rearm only after an aircraft was last observed at least ten minutes ago
@@ -678,6 +771,7 @@ class Bot:
                                            {"command": "status", "description": "Check active alerts"},
                                            {"command": "stop", "description": "Stop alerts and delete saved location"},
                                            {"command": "promo", "description": "Redeem a promo code for this chat"},
+                                           {"command": "register", "description": "Register with OpenSky and get API credentials"},
                                            {"command": "credentials", "description": "Connect own API credentials in private"},
                                            {"command": "access", "description": "Check flight-data access"},
                                            {"command": "disconnect", "description": "Remove access and saved credentials"}])
@@ -738,13 +832,21 @@ def main():
     except ValueError:
         raise SystemExit("POLL_INTERVAL_SECONDS must be at least 15.") from None
     try:
+        idle_max = float(os.environ.get("IDLE_POLL_MAX_SECONDS") or str(interval))
+        if not math.isfinite(idle_max) or not interval <= idle_max <= max(interval, 3600):
+            raise ValueError
+    except ValueError:
+        raise SystemExit("IDLE_POLL_MAX_SECONDS must be between POLL_INTERVAL_SECONDS and 3600.") from None
+    try:
         store = WatchStore(os.environ.get("STATE_DB_PATH", "data/airways.sqlite3"))
+        global API_USAGE
+        API_USAGE = APIUsage(os.environ.get("STATE_DB_PATH", "data/airways.sqlite3"))
         admin_server = None
         if os.environ.get("ADMIN_PASSWORD"):
             from admin import start_admin
             admin_server = start_admin(os.environ.get("STATE_DB_PATH", "data/airways.sqlite3"))
         owner_provider = OpenSky(client_id, client_secret) if client_id else None
-        Bot(token, owner_provider, radius, store, FlightDetails(), interval, vault=vault).run()
+        Bot(token, owner_provider, radius, store, FlightDetails(), interval, vault=vault, idle_max=idle_max).run()
     except KeyboardInterrupt:
         LOG.info("Airways stopped")
     except APIError as error:

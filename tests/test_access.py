@@ -27,6 +27,25 @@ class PromoTests(unittest.TestCase):
         self.assertFalse(self.store.redeem(promo["code"], 124, 456))
         self.assertIsNone(self.store.get_access(124))
 
+    def test_custom_code_is_normalized_redeemable_and_stored_only_as_hash(self):
+        promo = self.store.create_promo('Family', code=' family_2026 ')
+        self.assertEqual(promo['code'], 'FAMILY_2026')
+        self.assertTrue(self.store.redeem('family_2026', 123, 123))
+        self.assertNotIn('FAMILY_2026', str(tuple(self.store.db.execute('SELECT * FROM promos').fetchone())))
+        self.assertNotIn('FAMILY_2026', json.dumps(self.store.dashboard()))
+
+    def test_custom_code_cannot_duplicate_revoked_or_differently_cased_code(self):
+        promo = self.store.create_promo('First', code='Family2026')
+        self.store.revoke_promo(promo['id'])
+        with self.assertRaisesRegex(ValueError, 'already exists'):
+            self.store.create_promo('Second', code='family2026')
+        self.assertEqual(len(self.store.dashboard()['promos']), 1)
+
+    def test_invalid_custom_codes_are_rejected(self):
+        for code in ('short', 'a' * 65, 'with space', '<script>', 'café2026', [], None):
+            with self.subTest(code=code), self.assertRaisesRegex(ValueError, 'Custom code'):
+                self.store.create_promo('Invalid', code=code)
+
     def test_expired_code_and_expired_grant_are_separate(self):
         promo = self.store.create_promo("Short", redeem_days=1, grant_days=30)
         self.assertTrue(self.store.redeem(promo["code"], 123, 456))
@@ -98,11 +117,45 @@ class ActivationTests(unittest.TestCase):
     def message(self, text="", **extra):
         return {"message": {"chat": self.chat, "from": {"id": 123}, "message_id": 42, "text": text, **extra}}
 
-    def test_unauthorized_location_never_uses_owner_or_creates_watch(self):
+    def test_free_location_uses_owner_without_creating_watch(self):
         self.bot.handle(self.message(location={"latitude": 38.7, "longitude": -9.1}))
+        self.owner.nearby.assert_called_once_with(38.7, -9.1, 50)
+        self.assertIsNone(self.store.get(123))
+        self.assertIn("No watch started", self.bot.send.call_args.args[1])
+
+    def test_free_cannot_start_watch_by_reply(self):
+        self.bot.handle(self.message('/watch', reply_to_message={'location': {'latitude': 38.7, 'longitude': -9.1}}))
         self.owner.nearby.assert_not_called()
         self.assertIsNone(self.store.get(123))
-        self.assertIn("Activate flight data first", self.bot.send.call_args.args[1])
+        self.assertIn('require a promo code', self.bot.send.call_args.args[1])
+
+    def test_free_live_edits_do_not_trigger_checks_even_for_paused_watch(self):
+        self.store.set_location(123, 38.7, -9.1, 50, location_message_id=42)
+        self.bot.handle({'edited_message': self.message(location={'latitude': 39, 'longitude': -9})['message']})
+        self.owner.nearby.assert_not_called()
+        self.assertEqual(self.store.get(123)['lat'], 38.7)
+
+    def test_free_without_owner_credentials_explains_setup(self):
+        self.bot.provider = None
+        self.bot.handle(self.message(location={'latitude': 38.7, 'longitude': -9.1}))
+        self.assertIsNone(self.store.get(123))
+        self.assertIn('owner must configure OpenSky', self.bot.send.call_args.args[1])
+
+    def test_credentials_without_arguments_shows_registration_without_deletion(self):
+        self.bot.handle(self.message('/credentials'))
+        self.bot.call.assert_not_called()
+        text = self.bot.send.call_args.args[1]
+        self.assertIn('https://opensky-network.org/my-opensky/account', text)
+        self.assertIn('Register or sign in', text)
+        self.assertIn('create an API client', text)
+        self.assertIn('/credentials CLIENT_ID CLIENT_SECRET', text)
+
+    def test_register_shows_provider_website_and_group_setup_template(self):
+        self.chat = {'id': -123, 'type': 'group'}
+        self.bot.handle(self.message('/register'))
+        self.bot.call.assert_not_called()
+        self.assertIn('Register or sign in at OpenSky', self.bot.send.call_args.args[1])
+        self.assertIn('/credentials -123 CLIENT_ID CLIENT_SECRET', self.bot.send.call_args.args[1])
 
     def test_existing_unactivated_watch_never_uses_owner(self):
         self.store.set_location(123, 38.7, -9.1, 50)
@@ -159,7 +212,7 @@ class ActivationTests(unittest.TestCase):
         self.assertNotIn("customer-secret", grant["credentials"])
         with patch("bot.OpenSky", return_value=customer) as factory:
             self.assertIs(self.bot.provider_for(123), customer)
-            factory.assert_called_once_with("customer-id", "customer-secret")
+            factory.assert_called_once_with("customer-id", "customer-secret", usage_scope="customer")
         self.assertNotIn("customer-secret", json.dumps(self.store.dashboard()))
         self.assertNotIn(grant["credentials"], json.dumps(self.store.dashboard()))
         customer.nearby.side_effect = APIError(429)
