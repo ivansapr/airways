@@ -4,7 +4,7 @@ import tempfile
 from pathlib import Path
 from unittest.mock import Mock, patch
 
-from bot import APIError, Bot, FlightDetails, OpenSky, aircraft_name, bounding_boxes, distance_km, format_report, nearby_aircraft
+from bot import APIError, Bot, FlightDetails, OpenSky, aircraft_name, airport_label, bounding_boxes, distance_km, format_report, nearby_aircraft
 from tracking import WatchStore
 
 
@@ -353,9 +353,16 @@ class FlightDetailsTests(unittest.TestCase):
             plane, = nearby_aircraft([state()], 38.73, -9.14, 50, NOW)
             details.enrich(plane)
             self.assertEqual(plane.aircraft_type, "Boeing 737-800")
-            self.assertEqual(plane.route, "Lisbon → Madrid → London")
+            self.assertEqual(plane.route, "Lisbon (LIS) → Madrid (MAD) → London (EGLL)")
             self.assertEqual(plane.photo_url, "https://photos.example.com/aircraft.jpg")
         self.assertEqual(request.call_count, 1)
+
+    def test_airport_codes_prefer_iata_and_handle_missing_or_invalid_values(self):
+        self.assertEqual(airport_label({"municipality": "Valencia", "iata_code": " vlc ", "icao_code": "LEVC"}), "Valencia (VLC)")
+        self.assertEqual(airport_label({"municipality": "Venice", "iata_code": "VCE"}), "Venice (VCE)")
+        self.assertEqual(airport_label({"municipality": "Lisbon"}), "Lisbon")
+        self.assertEqual(airport_label({"municipality": "London", "iata_code": "N/A", "icao_code": "EGLL"}), "London (EGLL)")
+        self.assertEqual(airport_label({}), "")
 
     def test_aircraft_name_avoids_duplicate_manufacturer_and_expands_code(self):
         self.assertEqual(aircraft_name({"manufacturer": "AIRBUS", "type": "Airbus A320"}), "Airbus A320")
@@ -369,7 +376,7 @@ class FlightDetailsTests(unittest.TestCase):
                                                 "destination": {"iata_code": "LIS"}}}}
         plane, = nearby_aircraft([state()], 38.73, -9.14, 50, NOW)
         FlightDetails().enrich(plane)
-        self.assertEqual(plane.route, "London Heathrow Airport → Unknown")
+        self.assertEqual(plane.route, "London Heathrow Airport → Unknown (LIS)")
         self.assertEqual(plane.photo_url, "")
 
     @patch("bot.request_json", side_effect=APIError(404))

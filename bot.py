@@ -228,6 +228,16 @@ def aircraft_name(aircraft):
     return names.get(code, " ".join(part for part in (manufacturer, code) if part) or "Unknown")[:80]
 
 
+def airport_label(airport):
+    name = str(airport.get("municipality") or airport.get("name") or "").strip()[:80]
+    iata = str(airport.get("iata_code") or "").strip().upper()
+    icao = str(airport.get("icao_code") or "").strip().upper()
+    code = iata if re.fullmatch(r"[A-Z]{3}", iata) else icao if re.fullmatch(r"[A-Z]{4}", icao) else ""
+    if code:
+        return f"{name or 'Unknown'} ({code})"
+    return name
+
+
 class FlightDetails:
     """Best-effort adsbdb lookups; cache only in memory, never build a route database."""
 
@@ -258,7 +268,7 @@ class FlightDetails:
                 if parsed.scheme == "https" and parsed.hostname and not parsed.username and not parsed.password:
                     plane.photo_url = photo
             airports = [route.get(part) or {} for part in ("origin", "midpoint", "destination")]
-            cities = [str(port.get("municipality") or port.get("name") or "").strip()[:80] for port in airports]
+            cities = [airport_label(port) for port in airports]
             if cities[0] or cities[-1]:
                 plane.route = " → ".join([cities[0] or "Unknown"] + ([cities[1]] if cities[1] else []) + [cities[-1] or "Unknown"])
             ttl = 3600
