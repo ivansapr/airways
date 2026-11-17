@@ -126,7 +126,7 @@ class BotTests(unittest.TestCase):
     def setUp(self):
         self.provider = Mock()
         self.provider.nearby.return_value = (nearby_aircraft([state()], 38.73, -9.14, 50, NOW), NOW)
-        self.bot = Bot("test-token", self.provider, widgets_enabled=False)
+        self.bot = Bot("test-token", self.provider)
         authorize(self.bot.store, 123, -123)
         self.addCleanup(self.bot.store.db.close)
         self.bot.call = Mock()
@@ -243,7 +243,7 @@ class MonitoringTests(unittest.TestCase):
         self.store = WatchStore()
         authorize(self.store, 123)
         self.addCleanup(self.store.db.close)
-        self.bot = Bot("token", self.provider, store=self.store, widgets_enabled=False)
+        self.bot = Bot("token", self.provider, store=self.store)
         self.bot.send = Mock()
         self.store.set_location(123, 38.73, -9.14, 50)
 
@@ -325,7 +325,7 @@ class MonitoringTests(unittest.TestCase):
             restored = WatchStore(path)
             self.addCleanup(restored.db.close)
             self.assertEqual(restored.offset(), 12345)
-            bot = Bot("token", self.provider, store=restored, widgets_enabled=False)
+            bot = Bot("token", self.provider, store=restored)
             bot.send = Mock()
             self.provider.nearby.return_value = (nearby_aircraft([state()], 38.73, -9.14, 50, NOW), NOW + 60)
             with patch("bot.time.time", return_value=NOW + 60):

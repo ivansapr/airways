@@ -47,7 +47,7 @@ class AnimationTests(unittest.TestCase):
         response.read.return_value = b'{"ok":true,"result":{"message_id":7}}'
         urlopen.return_value.__enter__.return_value = response
         gif = flight_gif(plane(), 1800000000)
-        bot = Bot('test', None, widgets_enabled=False)
+        bot = Bot('test', None)
         self.addCleanup(bot.store.db.close)
         bot.call('sendAnimation', chat_id=-123, caption='Lisbon → London', animation=gif,
                  disable_notification=True)

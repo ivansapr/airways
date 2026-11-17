@@ -15,7 +15,6 @@ services:
       ADMIN_SECURE_COOKIE: "${ADMIN_SECURE_COOKIE:-1}"
       SEARCH_RADIUS_KM: "${SEARCH_RADIUS_KM:-50}"
       POLL_INTERVAL_SECONDS: "${POLL_INTERVAL_SECONDS:-60}"
-      TELEGRAM_WIDGETS: "${TELEGRAM_WIDGETS:-1}"
       STATE_DB_PATH: "/data/airways.sqlite3"
     expose:
       - "8080"

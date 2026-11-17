@@ -1,4 +1,4 @@
-"""Airways: nearby-flight alerts with per-chat API access and animated flight boards."""
+"""Airways: nearby-flight alerts with per-chat API access."""
 
 import html
 import json
@@ -18,8 +18,6 @@ from urllib.request import Request, urlopen
 
 from tracking import WatchStore
 from access import CredentialVault
-from flight_widget import widget_caption
-from flight_animation import flight_gif
 
 LOG = logging.getLogger("airways")
 EARTH_KM = 6371.0088
@@ -301,7 +299,7 @@ def format_report(aircraft, radius, timestamp, alert=False):
 
 
 class Bot:
-    def __init__(self, token, provider, radius=50, store=None, details=None, interval=60, vault=None, widgets_enabled=True):
+    def __init__(self, token, provider, radius=50, store=None, details=None, interval=60, vault=None):
         self.base = f"https://api.telegram.org/bot{token}/"
         self.provider, self.radius = provider, radius
         self.cooldowns = {}
@@ -313,8 +311,6 @@ class Bot:
         self.vault = vault
         self.customer_providers = {}
         self.activation_attempts = {}
-        self.widgets_enabled = widgets_enabled
-        self.widget_unavailable_until = 0
 
     def provider_for(self, chat_id):
         grant = self.store.get_access(chat_id)
@@ -446,22 +442,7 @@ class Bot:
         return self.call("sendMessage", **payload)
 
     def send_aircraft(self, chat_id, plane, radius, timestamp, alert=False):
-        result = self.send_aircraft_card(chat_id, plane, radius, timestamp, alert)
-        # GIFs work in groups and private chats without restricted HTML widgets.
-        if self.widgets_enabled and time.monotonic() >= self.widget_unavailable_until:
-            try:
-                self.call("sendAnimation", chat_id=chat_id, animation=flight_gif(plane, timestamp),
-                          caption=widget_caption(plane, timestamp), width=960, height=656,
-                          disable_notification=True)
-            except APIError as error:
-                LOG.info("Flight animation unavailable (status %s); flight card was delivered", error.status)
-                if error.status in (400, 403, 404):
-                    self.widget_unavailable_until = time.monotonic() + 3600
-                elif error.status == 429:
-                    self.telegram_blocked_until = time.time() + error.retry_after
-            except (ValueError, OSError):
-                LOG.warning("Flight animation could not be built; flight card was delivered")
-        return result
+        return self.send_aircraft_card(chat_id, plane, radius, timestamp, alert)
 
     def send_aircraft_card(self, chat_id, plane, radius, timestamp, alert=False):
         caption = format_report([plane], radius, timestamp, alert=alert)
@@ -754,8 +735,7 @@ def main():
             from admin import start_admin
             admin_server = start_admin(os.environ.get("STATE_DB_PATH", "data/airways.sqlite3"))
         owner_provider = OpenSky(client_id, client_secret) if client_id else None
-        Bot(token, owner_provider, radius, store, FlightDetails(), interval, vault=vault,
-            widgets_enabled=os.environ.get("TELEGRAM_ANIMATIONS", os.environ.get("TELEGRAM_WIDGETS", "1")) != "0").run()
+        Bot(token, owner_provider, radius, store, FlightDetails(), interval, vault=vault).run()
     except KeyboardInterrupt:
         LOG.info("Airways stopped")
     except APIError as error:

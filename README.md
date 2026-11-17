@@ -92,13 +92,11 @@ The initial report shows up to eight nearest aircraft. Subsequent checks send in
 
 Watches, duplicate history, and Telegram update offsets are stored in SQLite. Keep the database on persistent storage. `/stop` deletes location and duplicate history, while aggregate chat activity remains visible in the dashboard. The bot also removes watches when Telegram reports that it was removed or blocked.
 
-## Animated Telegram flight board
+## Telegram flight preview
 
-Alerts in private and group chats include an amber dot-matrix GIF beside the aircraft photo/text card. It loops between a flight overview (callsign, origin, destination, distance) and aircraft details (model, altitude, speed, distance), with a staggered LED refresh. Each screen holds for about three seconds. The observation time stays visible. Full original city names also remain in the caption; the LED font uses uppercase Latin transliterations.
+Each flight sends one aircraft photo with a caption containing the callsign, route, aircraft model, altitude, speed, distance, observation time, and map/tracker links. If a matching photo is unavailable or rejected by Telegram, the same information is sent as a text card. No additional animation message is sent; the old `TELEGRAM_ANIMATIONS` and `TELEGRAM_WIDGETS` settings are no longer used.
 
-Set `TELEGRAM_ANIMATIONS=0` to disable additional GIF messages (default: `1`). Existing `TELEGRAM_WIDGETS=0` configurations still disable animations unless overridden by the new setting. GIFs use Telegram's standard `sendAnimation` upload; restricted HTML widgets are no longer sent. Telegram/client autoplay settings determine whether the GIF plays automatically.
-
-`flight_animation.py` renders the GIF in memory with Pillow and an embedded LED font. No external fonts, image downloads, extra flight-data lookups, or refresh requests are needed. Each GIF is a snapshot of the observation, not a live feed. If animation upload fails, the delivered photo/text remains; rate limits pause subsequent alerts. The board contains no credentials, promo codes, or user coordinates.
+See the [static photo-card preview](preview/README.md) for a sample alert.
 
 ## Admin dashboard
 
