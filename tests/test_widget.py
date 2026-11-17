@@ -69,7 +69,7 @@ class WidgetTests(unittest.TestCase):
                 call = self.bot.call.call_args
                 self.assertEqual(call.args[0], "sendPhoto")
                 self.assertEqual(call.kwargs["photo"], self.plane.photo_url)
-                for detail in ("Passing nearby", "TAP123", "Lisbon → London", "Boeing 737-800", "9,100 m", "720 km/h", "4.2 km"):
+                for detail in ("TAP123", "Lisbon → London", "Boeing 737-800", "9,100 m", "720 km/h", "https://globe.adsbexchange.com/?icao=abc123"):
                     self.assertIn(detail, call.kwargs["caption"])
 
     def test_failed_photo_preserves_normal_retry_behavior(self):

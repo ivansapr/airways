@@ -2,7 +2,7 @@
 
 Send a location to the Telegram bot to start live nearby-flight alerts. Airways works in private chats and groups, saves one watch location per chat, and notifies the chat when aircraft enter the search radius.
 
-Each aircraft gets its own flight card with a photo when available, callsign, full route city names, readable aircraft name (for example, Boeing 737-800), distance, altitude, speed, and map/tracker links. Heading, position age, ICAO address, and registered country are omitted from the displayed card. Live positions come from OpenSky; route and aircraft details are looked up with adsbdb. Missing details appear as **Unknown**. Routes are callsign-based database matches, not a verified live itinerary, and can be outdated.
+Each aircraft gets its own flight card with a photo when available, callsign, full route city names, readable aircraft name (for example, Boeing 737-800), altitude, speed, and a tracker link on the callsign. Heading, position age, ICAO address, and registered country are omitted from the displayed card. Live positions come from OpenSky; route and aircraft details are looked up with adsbdb. Missing details appear as **Unknown**. Routes are callsign-based database matches, not a verified live itinerary, and can be outdated.
 
 A password-protected admin dashboard shows usage, chats, active watches, and bot health. Python 3.10+ is supported. The cryptography package encrypts customer API credentials at rest.
 
@@ -94,7 +94,7 @@ Watches, duplicate history, and Telegram update offsets are stored in SQLite. Ke
 
 ## Telegram flight preview
 
-Each flight sends one aircraft photo with a caption containing the callsign, route, aircraft model, altitude, speed, distance, observation time, and map/tracker links. If a matching photo is unavailable or rejected by Telegram, the same information is sent as a text card. No additional animation message is sent; the old `TELEGRAM_ANIMATIONS` and `TELEGRAM_WIDGETS` settings are no longer used.
+Each flight sends one aircraft photo with a compact caption: a bold tracker-linked callsign beside the route, aircraft model on the next line, then altitude and speed. The footer contains only OpenSky Network and adsbdb source links. Distance, date/time, field labels, and the separate map link are omitted. If a matching photo is unavailable or rejected by Telegram, the same information is sent as a text card. No additional animation message is sent; the old `TELEGRAM_ANIMATIONS` and `TELEGRAM_WIDGETS` settings are no longer used.
 
 See the [static photo-card preview](preview/README.md) for a sample alert.
 

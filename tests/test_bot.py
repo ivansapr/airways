@@ -81,10 +81,17 @@ class AircraftTests(unittest.TestCase):
         result = nearby_aircraft([row], 38.73, -9.14, 50, NOW)
         report = format_report(result, 50, NOW)
         self.assertIn("&lt;TAP&amp;123&gt;", report)
-        self.assertIn("Altitude unknown", report)
+        self.assertIn("unknown altitude · unknown speed", report)
         for removed in ("Heading", "Position", "ICAO", "Registered country"):
             self.assertNotIn(removed, report)
-        self.assertIn("coverage may be incomplete", report)
+        self.assertIn('<a href="https://opensky-network.org/">OpenSky Network</a>', report)
+        self.assertIn('<a href="https://www.adsbdb.com/">adsbdb</a>', report)
+        self.assertNotIn("Checked", report)
+        self.assertNotIn("UTC", report)
+        self.assertNotIn("may be outdated", report)
+        for removed in ("Passing nearby", "km away", "Map</a>", "Route:", "Aircraft:", "Altitude", "Speed"):
+            self.assertNotIn(removed, report)
+        self.assertIn('<b><a href="https://globe.adsbexchange.com/?icao=abc123">', report)
 
     def test_report_limits_results_and_fits_telegram(self):
         rows = [state(f"{i:06x}") for i in range(20)]
@@ -256,7 +263,7 @@ class MonitoringTests(unittest.TestCase):
         self.tick([state()], NOW)
         self.tick([state()], NOW + 60)
         self.assertEqual(self.bot.send.call_count, 1)
-        self.assertIn("Passing nearby", self.bot.send.call_args.args[1])
+        self.assertIn("globe.adsbexchange.com", self.bot.send.call_args.args[1])
         self.tick([state(), state("abc124")], NOW + 120)
         self.assertEqual(self.bot.send.call_count, 2)
         self.assertIn("abc124", self.bot.send.call_args.args[1])
@@ -371,9 +378,9 @@ class FlightDetailsTests(unittest.TestCase):
         FlightDetails().enrich_all([plane])
         self.assertEqual(plane.route, "Unknown")
         report = format_report([plane], 50, NOW)
-        self.assertIn("Altitude 9,100 m", report)
-        self.assertIn("Speed 720 km/h", report)
-        self.assertIn("Aircraft: Unknown", report)
+        self.assertIn("9,100 m · 720 km/h", report)
+        self.assertNotIn("Speed", report)
+        self.assertIn("\nUnknown\n", report)
 
 
 if __name__ == "__main__":

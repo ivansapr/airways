@@ -277,25 +277,24 @@ class FlightDetails:
 
 
 def format_report(aircraft, radius, timestamp, alert=False):
-    stamp = datetime.fromtimestamp(timestamp, timezone.utc).strftime("%H:%M UTC")
     if not aircraft:
         return (f"No recently reported airborne aircraft within {radius:g} km.\n"
-                f"Checked {stamp}. Coverage can be incomplete; try again shortly.")
-    title = "Passing nearby" if alert else f"{len(aircraft)} aircraft within {radius:g} km"
-    lines = [f"✈️ <b>{title}</b>", f"Checked {stamp} · nearest first"]
+                "Coverage can be incomplete; try again shortly.")
+    lines = []
     for plane in aircraft[:8]:
-        altitude = f"{plane.altitude:,.0f} m" if plane.altitude is not None else "unknown"
-        speed = f"{plane.speed * 3.6:.0f} km/h" if plane.speed is not None else "unknown"
+        altitude = f"{plane.altitude:,.0f} m" if plane.altitude is not None else "unknown altitude"
+        speed = f"{plane.speed * 3.6:.0f} km/h" if plane.speed is not None else "unknown speed"
+        tracker = "https://globe.adsbexchange.com/?" + urlencode({"icao": plane.icao})
         lines.append(
-            f'\n<b>{html.escape(plane.callsign[:32])}</b> · {plane.distance:.1f} km away\n'
-            f'Route: {html.escape(plane.route)}\nAircraft: {html.escape(plane.aircraft_type[:80])}\n'
-            f'Altitude {altitude} · Speed {speed}\n'
-            f'<a href="https://www.google.com/maps/search/?api=1&amp;query={plane.lat:.5f},{plane.lon:.5f}">Map</a> · '
-            f'<a href="https://globe.adsbexchange.com/?icao={plane.icao}">Aircraft tracker</a>')
+            f'<b><a href="{html.escape(tracker, quote=True)}">{html.escape(plane.callsign[:32])}</a></b> '
+            f'{html.escape(plane.route)}\n'
+            f'{html.escape(plane.aircraft_type[:80])}\n'
+            f'{altitude} · {speed}')
     if len(aircraft) > 8:
-        lines.append(f"\nShowing the nearest 8 of {len(aircraft)} aircraft.")
-    lines.append("\nOpenSky Network · coverage may be incomplete.\nRoute/type: adsbdb · route is a callsign lookup, may be outdated.")
-    return "\n".join(lines)
+        lines.append(f"Showing the nearest 8 of {len(aircraft)} aircraft.")
+    lines.append('<a href="https://opensky-network.org/">OpenSky Network</a> · '
+                 '<a href="https://www.adsbdb.com/">adsbdb</a>')
+    return "\n\n".join(lines)
 
 
 class Bot:
